@@ -15,7 +15,6 @@
 #include "vars.h"
 #include "screens.h"
 
-
 uint32_t lastTick = 0;
 
 int Machine_ID = 99;
@@ -38,7 +37,7 @@ double stopDuration = 0;
 char* URL = "";
 char* operatorID = "";
 char* command = "";
-uint8_t stopCode = 0;
+uint8_t stopCode = 100;
 uint8_t stageCode = 103;
 
 // Touchscreen pins
@@ -55,11 +54,19 @@ TFT_eSPI tft = TFT_eSPI();
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 480
 
-#define I2C_ADDRESS 0x08  // I2C address of the ESP32
-#define BUFFER_SIZE 10
-char i2cBuffer[BUFFER_SIZE];
 
+constexpr int I2C_SDA = 21;  // screen I2C SDA
+constexpr int I2C_SCL = 22;  // screen I2C SCL
+#define I2C_BUFFER_SIZE 64
+char i2cBuffer[I2C_BUFFER_SIZE];
+volatile int receivedLength = 0;
 volatile bool dataReceivedFlag = false;
+// ==================== I2C COMMAND QUEUE ====================
+#define I2C_QUEUE_SIZE 8
+char i2cQueue[I2C_QUEUE_SIZE][I2C_BUFFER_SIZE];
+volatile uint8_t queueHead = 0;
+volatile uint8_t queueTail = 0;
+
 
 // Touchscreen coordinates: (x, y) and pressure (z)
 int x, y, z;
@@ -90,8 +97,13 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // Wire.begin(I2C_ADDRESS);
-  // Wire.onReceive(receiveEvent);
+  // Prevent common TFT_eSPI + ESP32 APB callback warning
+  WiFi.mode(WIFI_OFF);
+  WiFi.setSleep(true);
+
+  Wire.setPins(I2C_SDA, I2C_SCL);
+  Wire.begin(0x08);
+  Wire.onReceive(receiveEvent);
 
   // Start LVGL
   lv_init();
@@ -123,137 +135,134 @@ void setup() {
   Serial.println("preparation is done!");
   delay(1000);
 
-  command = "data";
+  command = "Data";
   SendData();
 }
 void loop() {
 
-  // if (dataReceivedFlag) {
-  //   char prefix = i2cBuffer[0];
-  //   int value = 0;
-  //   if (strlen(i2cBuffer) > 1) {
-  //     value = atoi(&i2cBuffer[1]);
-  //   } else {
-  //     Serial.println("Invalid I2C data");
-  //     dataReceivedFlag = false;
-  //     return;
-  //   }
-  //   dataReceivedFlag = false;
-  //   switch (prefix) {
-  //     case 'H':
-  //       stopCode = value;
-  //       break;
-  //     case 'P':
-  //       performance = value / 10;
-  //       break;
-  //     case 'S':
-  //       linearSpeed = value;
-  //       angulareSpeed = linearSpeed / 3.15;
-  //       break;
-  //     case 'M':
-  //       beamLength = value;
-  //       break;
-  //     case 'R':
-  //       drumRevolutions = value;
-  //       break;
-  //     case 'N':
-  //       Machine_ID = value;
-  //       break;
-  //     case 'X':
-  //       isConnected = value == 1 ? true : false;
-  //       break;
-  //     case 'Y':
-  //       section = value;
-  //       break;
-  //     default:
-  //       Serial.println(F("Unknown command"));
-  //       return;  // Exit if the prefix is unrecognized
-  //   }
-  // }
+  // ==================== PROCESS I2C QUEUE ====================
+  while (queueTail != queueHead) {  // while there are commands in queue
+    char* cmd = i2cQueue[queueTail];
+    char prefix = cmd[0];
+    int value = atoi(&cmd[1]);
+
+    Serial.printf("I2C received: %s  → prefix=%c value=%d\n", cmd, prefix, value);
+
+    switch (prefix) {
+      case 'H': stopCode = value; break;
+      case 'O':
+        stageCode = value;
+        switch (value) {
+          case 103: currentStage = ENCANTRAGE; break;
+          case 106: currentStage = ENCANTRAGE_PARTIEL; break;
+          case 104: currentStage = FIN_ENCANTRAGE; break;
+          case 105: currentStage = NOUAGE; break;
+          case 107: currentStage = PIQUAGE; break;
+          case 109: currentStage = OURDISSAGE; break;
+          case 111: currentStage = ENSOUPLAGE; break;
+          case 112: currentStage = FIN_ENSOUPLAGE; break;
+          default: Serial.printf("Unknown stage code: %d\n", value);
+        }
+        break;
+      case 'N': Machine_ID = value; break;
+      case 'P': performance = (float)value / 10.0; break;
+      case 'M': beamLength = value; break;
+      case 'R': drumRevolutions = value; break;
+      case 'S': linearSpeed = (float)value / 100.0; break;
+      case 'A': angulareSpeed = (float)value / 100.0; break;
+      case 'X': isConnected = (value == 1); break;
+      case 'Y': section = value; break;
+      default: Serial.printf("Unknown I2C prefix: %c (full: %s)\n", prefix, cmd);
+    }
+
+    // Move to next command
+    queueTail = (queueTail + 1) % I2C_QUEUE_SIZE;
+  }
 
   uint32_t now = millis();
   if (now - lastTick >= 1000) {
     lastTick = now;
-    if (stopCode == 0) {  // Machine is running
+    if (stopCode == 100) {  // Machine is running
       stageDuration++;
     } else {  // Machine is stopped
       stopDuration++;
     }
+    if (stopCode == 101 || stopCode == 102) {
+      stageDuration++;
+    }
   }
-
+  // === LVGL handling (safer timing) ===
   static unsigned long lastLvglTick = 0;
-  if (millis() - lastLvglTick >= 5) {
-    lv_tick_inc(5);
+  if (millis() - lastLvglTick >= 10) {  // try 15 or 20
+    lv_tick_inc(15);
     lastLvglTick = millis();
   }
   lv_task_handler();
   tick_screen_main();
-  delay(5);  // let this time pass
 }
+void receiveEvent(int numBytes) {
+  if (numBytes == 0) return;
 
-// void receiveEvent(int numBytes) {
-//   static int bufferIndex = 0;
-//   while (Wire.available() && bufferIndex < BUFFER_SIZE - 1) {
-//     char receivedChar = Wire.read();
-//     if (receivedChar == '\n') {
-//       i2cBuffer[bufferIndex] = '\0';
-//       bufferIndex = 0;
-//       dataReceivedFlag = true;
-//       Serial.print("Received via I2C: ");
-//       Serial.println(i2cBuffer);
-//     } else {
-//       i2cBuffer[bufferIndex++] = receivedChar;
-//     }
-//   }
-//   // Discard excess bytes
-//   while (Wire.available()) Wire.read();
-//   if (bufferIndex >= BUFFER_SIZE - 1) {
-//     i2cBuffer[BUFFER_SIZE - 1] = '\0';
-//     bufferIndex = 0;
-//     Serial.println("I2C buffer overflow");
-//   }
-// }
+  char tempBuf[I2C_BUFFER_SIZE];
+  int len = 0;
 
-void SendData() {
-  StaticJsonDocument<300> jsonDoc;
+  while (Wire.available() && len < I2C_BUFFER_SIZE - 1) {
+    char c = Wire.read();
+    if (c == '\n' || c == '\r') break;  // stop at newline
+    tempBuf[len++] = c;
+  }
+  tempBuf[len] = '\0';
 
-  if (strcmp(command, "Stage") == 0) {
-    jsonDoc["command"] = "Stage";
-    jsonDoc["stageCode"] = stageCode;
-    // Optional: jsonDoc["currentStage"] = (int)currentStage;  // if you need it
-  } else if (strcmp(command, "Halt") == 0) {
-    jsonDoc["command"] = "Halt";
-    jsonDoc["stopCode"] = stopCode;
-  } else if (strcmp(command, "machID") == 0) {
-    jsonDoc["command"] = "machID";
-    jsonDoc["machineID"] = Machine_ID;  // better key name
-  } else if (strcmp(command, "URL") == 0) {
-    jsonDoc["command"] = "URL";
-    jsonDoc["URL"] = URL;
-  } else if (strcmp(command, "Portal") == 0) {
-    jsonDoc["command"] = "Portal";
-  } else if (strcmp(command, "Reboot") == 0) {
-    jsonDoc["command"] = "Reboot";
-  } else if (strcmp(command, "Data") == 0) {
-    jsonDoc["command"] = "Data";
+  if (len < 2) return;  // invalid command
+
+  // Add to queue (circular buffer)
+  uint8_t nextHead = (queueHead + 1) % I2C_QUEUE_SIZE;
+  if (nextHead != queueTail) {  // not full
+    strncpy(i2cQueue[queueHead], tempBuf, I2C_BUFFER_SIZE - 1);
+    i2cQueue[queueHead][I2C_BUFFER_SIZE - 1] = '\0';
+    queueHead = nextHead;
   } else {
-    jsonDoc["command"] = command ? command : "Unknown";
+    Serial.println("I2C queue full!");
   }
-  // === Always add Operator ID when it's meaningful ===
-  if (operatorID != NULL && operatorID[0] != '\0') {
-    jsonDoc["OpID"] = operatorID;
-  }
-  // Serialize
-  String payload;
-  serializeJson(jsonDoc, payload);
-
-  command = "";
-
-  Serial.print("<START>");
-  Serial.print(payload);
-  Serial.println("<END>");
 }
+void SendData() {
+  Serial.print("<START>");
 
+  // Command
+  if (command && command[0] != '\0') {
+    Serial.print("cmd:");
+    Serial.print(command);
+  } else {
+    Serial.print("cmd:Data");
+  }
+
+  // Value (generic)
+  if (strcmp(command, "Stage") == 0) {
+    Serial.print(",value:");
+    Serial.print(stageCode);
+  } else if (strcmp(command, "Halt") == 0) {
+    Serial.print(",value:");
+    Serial.print(stopCode);
+  } else if (strcmp(command, "machID") == 0) {
+    Serial.print(",value:");
+    Serial.print(Machine_ID);
+  } else if (strcmp(command, "URL") == 0) {
+    if (URL && URL[0] != '\0') {
+      Serial.print(",value:");
+      Serial.print(URL);
+    }
+  }
+
+  // Operator ID (optional but consistent)
+  if (operatorID && operatorID[0] != '\0') {
+    Serial.print(",OpID:");
+    Serial.print(operatorID);
+  }
+
+  Serial.println("<END>");
+
+  operatorID = "0";
+}
 void printMemoryUsage() {
   size_t totalHeap = ESP.getHeapSize();             // Total heap size
   size_t freeHeap = ESP.getFreeHeap();              // Free heap size
