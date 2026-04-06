@@ -164,20 +164,47 @@ void action_show_keyboard(lv_event_t *e) {
   lv_obj_t *kb = objects.keyboard;
 
   if (code == LV_EVENT_FOCUSED) {
-    // 1. Attach textarea FIRST
+    // Attach textarea
     lv_keyboard_set_textarea(kb, ta);
-    // 2. THEN set mode (immediately after)
+
+    // Set keyboard mode
     if (ta == objects.machine_id_text_area || ta == objects.ip_textarea || ta == objects.port_textarea) {
       lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
     } else if (ta == objects.db_textarea) {
       lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_USER_1);
+    } else if (ta == objects.operator_id_text_area) {
+      lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);  // Force numerical
+    } else {
+      lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     }
-    // 3. Show keyboard LAST
+
+    // Show keyboard
     lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(kb);
+
+    // Scroll ONLY when focusing db_textarea or port_textarea
+    if (content_panel != NULL && ta != NULL) {
+      lv_obj_update_layout(content_panel);
+
+      if (ta == objects.db_textarea || ta == objects.port_textarea || objects.ip_textarea) {
+        lv_obj_set_scrollbar_mode(content_panel, LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_scroll_to_view(ta, LV_ANIM_ON);
+      } else if (ta == objects.operator_id_text_area) {
+        // On Operator ID page we usually don't need much scroll
+        lv_obj_set_scrollbar_mode(content_panel, LV_SCROLLBAR_MODE_OFF);
+      }
+    }
   } else if (code == LV_EVENT_DEFOCUSED) {
-    lv_keyboard_set_textarea(kb, NULL);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    // Do NOT hide keyboard immediately on defocus for Operator ID page
+    if (displayIndex != OPERATORID_PAGE) {
+      lv_keyboard_set_textarea(kb, NULL);
+      lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Reset scroll state when leaving focus (important to prevent leak)
+    if (displayIndex != SETTINGS_PAGE) {
+      lv_obj_set_scrollbar_mode(content_panel, LV_SCROLLBAR_MODE_OFF);
+    }
   }
 }
 void action_close_haltabel(lv_event_t *e) {
@@ -210,7 +237,17 @@ void action_display(lv_event_t *e) {
     displayIndex = HALTCODES_PAGE;
   } else if (target == objects.resume_production) {
     command = "Halt";
-    stopCode = 0;
+    stopCode = 100;
+    hideReport = true;
+
+    // === CRITICAL: Immediately hide the overlay BEFORE changing page ===
+    if (!lv_obj_has_flag(objects.halt_report_panel, LV_OBJ_FLAG_HIDDEN)) {
+      lv_obj_add_flag(objects.halt_report_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (objects.halt_report_overlay != NULL && !lv_obj_has_flag(objects.halt_report_overlay, LV_OBJ_FLAG_HIDDEN)) {
+      lv_obj_add_flag(objects.halt_report_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+
     displayIndex = DEFAULT_PAGE;
     SendData();
   }
@@ -277,11 +314,15 @@ static lv_obj_t *create_content_panel(lv_obj_t *parent, int32_t x, int32_t y, in
   lv_obj_t *panel = lv_obj_create(parent);
   lv_obj_set_pos(panel, x, y);
   lv_obj_set_size(panel, w, h);
-  lv_obj_remove_flag(panel, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_remove_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  // Do NOT remove LV_OBJ_FLAG_SCROLLABLE here
+
   lv_obj_set_style_pad_top(panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_pad_bottom(panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_pad_left(panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_pad_right(panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+
   return panel;
 }
 // Helper: Create a simple button with label (most common case)
@@ -355,7 +396,9 @@ static lv_obj_t *create_textarea(lv_obj_t *parent, int32_t x, int32_t y, int32_t
 // Screens
 //
 void populate_DefaultPanel(lv_obj_t *parent) {
-  create_label(parent, 81, 0, "Stage de Prodction", &lv_font_montserrat_18);
+  create_label(parent, 81, 0, "Etape de Prodction", &lv_font_montserrat_18);
+  lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
   objects.encontrage_led = create_led(parent, 17, 30, 0xffdcdcdc);
   objects.noage_led = create_led(parent, 81, 30, 0xffdcdcdc);
@@ -449,7 +492,6 @@ void populate_DefaultPanel(lv_obj_t *parent) {
     lv_obj_set_style_outline_width(objects.angulare_speed, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     create_label(objects.angulare_speed, 0, 0, "RPM", &lv_font_montserrat_16);
-    create_label(objects.angulare_speed, 103, 1, "Hz", &lv_font_montserrat_16);
 
     objects.angulare_speed_value = create_label_centered(objects.angulare_speed, 0, 0, "", &lv_font_montserrat_24);
     lv_obj_set_style_text_color(objects.angulare_speed_value, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -457,6 +499,7 @@ void populate_DefaultPanel(lv_obj_t *parent) {
   }
 }
 void populate_CategoriesPanel(lv_obj_t *parent) {
+  lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t *lbl = create_label(parent, 0, 0, "Categories D'arrets ", &lv_font_montserrat_20);
   lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 5);
   objects.mecanical_category = create_button_with_font(parent, 8, 50, 290, 50, "Arrets Mecaniqe", &lv_font_montserrat_22, action_set_category, (void *)1);
@@ -465,10 +508,12 @@ void populate_CategoriesPanel(lv_obj_t *parent) {
 }
 void populate_HaltCodesPanel(lv_obj_t *parent) {
   objects.category_label_title = create_label(parent, 0, 0, "", &lv_font_montserrat_20);
+  lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_align(objects.category_label_title, LV_ALIGN_TOP_MID, 0, 5);
 
   switch (currentCategory) {
-    case STAGES: lv_label_set_text(objects.category_label_title, "Stage de Production"); break;
+    case STAGES: lv_label_set_text(objects.category_label_title, "Etapes de Production"); break;
     case MECHANICAL: lv_label_set_text(objects.category_label_title, "Arrets Mecanique"); break;
     case ELECTRICAL: lv_label_set_text(objects.category_label_title, "Arrets Electrique"); break;
     case OPERATOR: lv_label_set_text(objects.category_label_title, "Actions d'Operateur"); break;
@@ -531,40 +576,43 @@ void populate_HaltCodesPanel(lv_obj_t *parent) {
 }
 void populate_OperatorIDPanel(lv_obj_t *parent) {
   create_label(parent, 96, 5, "Identifiant ", &lv_font_montserrat_20);
+  lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
   objects.operator_id_text_area = create_textarea(parent, 3, 50, 300, 50, "insirer ID d\'operateur", "1,2,3,4,5,6,7,8,9,0,H,A,R,S", 16, action_show_keyboard);
   lv_obj_add_state(objects.operator_id_text_area, LV_STATE_FOCUSED);
+  lv_obj_set_style_text_font(objects.operator_id_text_area, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_keyboard_set_textarea(objects.keyboard, objects.operator_id_text_area);
   lv_keyboard_set_mode(objects.keyboard, LV_KEYBOARD_MODE_NUMBER);
   lv_obj_clear_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(objects.keyboard);
-  lv_obj_set_style_text_font(objects.keyboard, &lv_font_montserrat_28, LV_PART_MAIN | LV_STATE_DEFAULT);
+
 
   // Quick buttons
-  objects.button_h = create_button(parent, 4, 130, 56, 44, "H", action_set_operator_id, (void *)0);
+  objects.button_h = create_button_with_font(parent, 4, 130, 56, 44, "H", &lv_font_montserrat_24, action_set_operator_id, (void *)0);
   lv_obj_set_style_bg_opa(objects.button_h, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_width(objects.button_h, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_color(objects.button_h, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
 
-  objects.button_ar = create_button(parent, 68, 130, 56, 44, "AR", action_set_operator_id, NULL);
+  objects.button_ar = create_button_with_font(parent, 68, 130, 56, 44, "AR", &lv_font_montserrat_24, action_set_operator_id, NULL);
   lv_obj_set_style_bg_opa(objects.button_ar, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_width(objects.button_ar, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_color(objects.button_ar, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
 
-  objects.button_s = create_button(parent, 131, 130, 56, 44, "S", action_set_operator_id, (void *)0);
+  objects.button_s = create_button_with_font(parent, 131, 130, 56, 44, "S", &lv_font_montserrat_24, action_set_operator_id, (void *)0);
   lv_obj_set_style_bg_opa(objects.button_s, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_width(objects.button_s, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_color(objects.button_s, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
 
   // OK Button
-  objects.button_ok = create_button(parent, 195, 130, 108, 44, "OK", action_send_command, (void *)1);
+  objects.button_ok = create_button_with_font(parent, 195, 130, 108, 44, "OK", &lv_font_montserrat_24, action_send_command, (void *)1);
   lv_obj_set_style_bg_opa(objects.button_ok, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_width(objects.button_ok, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_color(objects.button_ok, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 void populate_SettingsPanel(lv_obj_t *parent) {
   lv_obj_set_scroll_dir(parent, LV_DIR_VER);
-  lv_obj_set_style_pad_bottom(parent, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_text_font(parent, &lv_font_montserrat_18, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);                   // Hide scrollbar by default
+  lv_obj_set_style_pad_bottom(parent, 100, LV_PART_MAIN | LV_STATE_DEFAULT);  // enough space for keyboard
 
   /// ==================== Machine ID Section ====================
   objects.set_machine_id = create_label(parent, 3, 10, "Machine ID", &lv_font_montserrat_18);
@@ -578,7 +626,7 @@ void populate_SettingsPanel(lv_obj_t *parent) {
   lv_obj_set_style_pad_left(objects.set_machine_id, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_pad_right(objects.set_machine_id, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-  objects.machine_id_text_area = create_textarea(objects.set_machine_id, 110, -9, 112, 38, "99", "0,1,2,3,4,5,6,7,8,9", 4, action_show_keyboard);
+  objects.machine_id_text_area = create_textarea(objects.set_machine_id, 110, -9, 112, 38, "ID", "0,1,2,3,4,5,6,7,8,9", 4, action_show_keyboard);
   lv_obj_set_style_text_align(objects.machine_id_text_area, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_textarea_set_max_length(objects.machine_id_text_area, 4);
 
@@ -590,7 +638,7 @@ void populate_SettingsPanel(lv_obj_t *parent) {
   objects.set_database_link = create_content_panel(parent, 3, 70, 300, 210);
   lv_obj_set_style_outline_width(objects.set_database_link, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_color(objects.set_database_link, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_pad_bottom(objects.set_database_link, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_bottom(objects.set_database_link, 100, LV_PART_MAIN | LV_STATE_DEFAULT);
 
   create_label(objects.set_database_link, 5, 15, "Server IP", &lv_font_montserrat_18);
   objects.ip_textarea = create_textarea(objects.set_database_link, 116, 5, 175, 40, "192.168.1.xx", ".,0,1,2,3,4,5,6,7,8,9", 15, action_show_keyboard);
@@ -601,11 +649,11 @@ void populate_SettingsPanel(lv_obj_t *parent) {
   create_label(objects.set_database_link, 5, 116, "Database", &lv_font_montserrat_18);
   objects.db_textarea = create_textarea(objects.set_database_link, 116, 105, 175, 40, "DBLOG", NULL, 32, action_show_keyboard);
 
-  objects.set_database_url = create_button(objects.set_database_link, 3, 157, 290, 40, "Set database URL", action_send_command, NULL);
+  objects.set_database_url = create_button_with_font(objects.set_database_link, 3, 157, 290, 40, "Set database URL", &lv_font_montserrat_20, action_send_command, NULL);
 
   // ==================== Open Portal Button ====================
-  objects.open_portal = create_button(parent, 8, 290, 290, 40, "Open WIFI Portal", action_send_command, NULL);
-  objects.reboot_system = create_button(parent, 8, 340, 290, 40, "Reboot", action_send_command, NULL);
+  objects.open_portal = create_button_with_font(parent, 8, 290, 290, 40, "Open WIFI Portal", &lv_font_montserrat_20, action_send_command, NULL);
+  objects.reboot_system = create_button_with_font(parent, 8, 340, 290, 40, "Reboot", &lv_font_montserrat_20, action_send_command, NULL);
   lv_obj_set_style_bg_color(objects.reboot_system, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
@@ -637,7 +685,7 @@ void create_screen_main(void) {
   lv_obj_clear_flag(objects.warning_stop, LV_OBJ_FLAG_HIDDEN);  // start visible (white)
 
   // WiFi symbol (will be updated in tick)
-  objects.wifi = create_label(objects.header_panel, 205, 7, "", &lv_font_montserrat_28);
+  objects.wifi = create_label(objects.header_panel, 215, 7, "", &lv_font_montserrat_28);
 
   // Setting icon
   objects.setting = create_label(objects.header_panel, 270, 4, LV_SYMBOL_SETTINGS, &lv_font_montserrat_34);
@@ -653,10 +701,13 @@ void create_screen_main(void) {
   lv_obj_remove_flag(objects.keyboard, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(objects.keyboard);
   lv_obj_add_event_cb(objects.keyboard, action_send_command, LV_EVENT_READY, NULL);
+  lv_obj_set_style_text_font(objects.keyboard, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
 
   // === SINGLE REUSABLE CONTENT CONTAINER (this is the key fix for DRAM) ===
   // All 5 pages will live here. When we switch pages we do lv_obj_clean() → only current page widgets exist.
   content_panel = create_content_panel(objects.main, 5, 60, 310, 415);
+  lv_obj_set_scroll_dir(content_panel, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(content_panel, LV_SCROLLBAR_MODE_AUTO);
 
   // Halt report panel is an overlay (always present, never deleted)
   // Halt report panel - Make it a real popup/modal
@@ -953,24 +1004,24 @@ void tick_screen_main() {
   }
   // HALT REPORT + WARNING ICON LOGIC - Exact behavior requested
   {
-    static int last_stopCode = 0;
+    static int last_stopCode = 100;
 
     // Automatic show report when stopCode becomes non-zero (new halt or changed halt)
-    if (stopCode != 0 && last_stopCode == 0) {
+    if (stopCode != 100 && last_stopCode == 100) {
       hideReport = false;  // show report on new stop
     }
     // Also show report if stopCode changed while already active
-    else if (stopCode != 0 && stopCode != last_stopCode) {
+    else if (stopCode != 100 && stopCode != last_stopCode) {
       hideReport = false;
     }
     // When stop ends completely
-    else if (stopCode == 0 && last_stopCode != 0) {
+    else if (stopCode == 100 && last_stopCode != 100) {
       hideReport = true;
     }
 
     last_stopCode = stopCode;
 
-    bool has_active_stop = (stopCode != 0);
+    bool has_active_stop = (stopCode != 100);
     bool show_report = !hideReport;  // show if not manually hidden
     bool show_warning = hideReport;  // warning visible only when report is hidden
 
@@ -1045,7 +1096,7 @@ void tick_screen_main() {
     }
 
     // Reset duration when stop ends
-    if (stopCode == 0 && stopDuration != 0) {
+    if (stopCode == 100 && stopDuration != 0) {
       stopDuration = 0;
       if (objects.halt_duration_timer_label != NULL) {
         lv_label_set_text(objects.halt_duration_timer_label, "00:00:00");
