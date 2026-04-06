@@ -18,75 +18,88 @@
 // Hardware Pin Definitions
 constexpr int ESP32_RXD0 = 44;             // GPIO44 -> ATmega328 TX
 constexpr int ESP32_TXD0 = 43;             // GPIO43 -> ATmega328 RX
-constexpr int CYD_RXD = 9;                 // Screen RX
-constexpr int CYD_TXD = 10;                // Screen TX
-constexpr int I2C_SDA = 14;                // screen I2C SDA
-constexpr int I2C_SCL = 21;                // screen I2C SCL
+constexpr int CYD_RXD = 10;                // Screen RX
+constexpr int CYD_TXD = 9;                 // Screen TX
+constexpr int I2C_SDA = 13;                // screen I2C SDA
+constexpr int I2C_SCL = 14;                // screen I2C SCL
 constexpr uint8_t SCREEN_I2C_ADDR = 0x08;  // screen address
-constexpr unsigned long I2C_INTERVAL = 20;
-#define I2C_DEBUG_LOG 0
 
-// Configuration
+volatile bool powerFailDetected = false;                   // to detect powerfail
 String API_BASE_URL = "http://192.168.1.248:7272/DBLOG/";  // Default API URL
-uint8_t MACHINE_ID = 99;                                   // Default Machine ID
-uint16_t speed = 0;
-
+uint8_t MACHINE_ID = 99;
 String host;
 String sessionToken = "";
-
-bool updating = false;
-bool triggerPortal = true;
-constexpr size_t BUFFER_SIZE = 32;
-constexpr int HTTP_TIMEOUT_MS = 6000;        // Http request timeout
-constexpr int MAX_RETRIES = 3;               // Http requests retries
-constexpr int SAFETY_BUFFER_MS = 60000;      // Time laps before connect to wifi
-constexpr size_t MAX_PENDING_COMMANDS = 60;  // Limit to prevent memory overflow
-constexpr unsigned long interval = 10000;
-unsigned long previousMillis = 0;
-volatile bool powerFailDetected = false;
-volatile bool f1Received = true;
-unsigned long lastI2CSentTime = 0;
-bool screenReady = false;
+constexpr int endPointPowerupTime = 60000UL;
+unsigned long restartTime = 0;
 bool webServerStarted = false;
-bool wifiSetupDone = false;
-bool screenRequested = false;
+bool updating = false;
 
+char screenBuffer[64];
+size_t screenBufPos = 0;
+constexpr int BUFFER_SIZE = 16;
+char commandBuffer[BUFFER_SIZE];
 
+std::queue<String> screenCommandQueue;
+std::queue<String> pendingWebRequests;
+
+enum class RxState {
+  IDLE,
+  WAITING_FOR_START,
+  RECEIVING_JSON
+};
+typedef enum {
+  ENCANTRAGE,
+  ENCANTRAGE_PARTIEL,
+  FIN_ENCANTRAGE,
+  NOUAGE,
+  PIQUAGE,
+  OURDISSAGE,
+  ENSOUPLAGE,
+  FIN_ENSOUPLAGE
+} ProductionStages;
 // Global State
 struct MachineState {
-  uint16_t revolutions = 0;
   float performance = 0.0;
-  int lastHaltCode = -1;
-  uint8_t haltIssue = 0;
-  bool isOperational = true;
-  bool wifiConnected = false;
+  bool onRepaire = true;
+  bool wifiConnected = true;
   bool resumeHaltCode = false;
-  unsigned long fCommandTimestamp = 0;
-  int lastCodeStop = -1;
-  String lastCodeLabel = "";
+  uint8_t stopCode = 100;
+  uint8_t previousStopCode = 0;
+  uint8_t stageCode = 0;
+  unsigned long powerfailTimestamp = 0;
+  int beamLength = 3500;
+  uint8_t windSection = 0;
+  int currentMeters = 0;
+  int drumRevs = 0;
+
+  bool wifiSetupDone = false;
+  bool triggerPortal = false;
 };
 // HTTP Request State
 struct HttpRequestState {
   bool active = false;
   unsigned long startTime = 0;
   int retryCount = 0;
-  // String url;
-  char url[128] = { 0 };
-  String json;
-  HTTPClient* http;
+  int MAX_RETRIES = 3;
+  int HTTP_TIMEOUT_MS = 6000;
+
   bool isFetchMachineData = false;
-  unsigned long nextRetryTime = 0;
+  unsigned long lastFetchTime = 0;
+
+  HTTPClient* http = nullptr;
+  String jsonPayload;
+  char url[128] = { 0 };
 };
-// screen commands
-struct ScreenCommand {
-  char prefix;
-  int value;
+// HTTP Request queu
+struct PendingWebRequest {
+  char operatorID[16] = { 0 };
+  uint8_t machineID = 0;
+  int haltCode = 0;
+  int16_t position = 0;
+  uint16_t revolutions = 0;
+  unsigned long timestamp = 0;  // when it was queued
 };
-// Global variable to track reconnection state
-struct WiFiReconnectState {
-  bool reconnecting = false;
-};
-// === NEW: Ourdissoire live data for instant WebSocket ===
+
 struct OurdissoireLive {
   String machineState = "normal_stop";  // running / normal_stop / chain_stop
   int currentMeters = 0;
@@ -96,7 +109,6 @@ struct OurdissoireLive {
 
 OurdissoireLive liveData;
 OurdissoireLive lastLiveSent;
-// dashboard data for update
 struct DashboardData {
   uint16_t revolutions = 0;
   float performance = 0.0f;
@@ -116,79 +128,54 @@ struct ScreenLastSent {
   uint8_t machine = 0;
   // add others only if you send them to screen
 };
-
-ScreenLastSent screenLast;
-
-// Queue for pending ATmega commands (raw <prefix><value> as array)
-using AtmegaCommand = std::string;
-std::queue<AtmegaCommand> pendingAtmegaCommands;
-// queue commands for screen updates
-std::queue<ScreenCommand> screenQueue;
-
-WiFiManager wm;
-Preferences preferences;
-WebServer server(80);
-WebSocketsServer webSocket(81);
-// Global Instances
-MachineState state;
-HttpRequestState httpState;
-WiFiReconnectState wifiState;
 DashboardData currentData;
 DashboardData lastSentData;
+
+WiFiManager wm;
+MachineState state;
+WebServer server(80);
+WebSocketsServer webSocket(81);
+Preferences preferences;
+HttpRequestState httpState;
+static RxState rxState = RxState::IDLE;
+ProductionStages currentStage = OURDISSAGE;
+
 // USART instances
 HardwareSerial atmegaSerial(0);  // UART0 for ATmega328
 HardwareSerial screenSerial(2);  // UART2 for screen
-
-volatile bool dataReceived = false;
-char commandBuffer[BUFFER_SIZE];
-String serialBuffer;
-char screenBuffer[512];
-size_t screenBufPos = 0;
-unsigned long lastFetchTime = 0;
-unsigned long restartTime = 0;
-
-uint16_t lastProductionStepCode = 0;
-String lastProductionStepLabel = "";
-
-// Function Prototypes
-void setupWiFi();
-void setupWebServer();
-void sendDashboardUpdate();
-void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+// ====== serial functions  sensors <=> main <=> screen display ============
+void serialTask(void* parameter);
+void handleScreenData();
+void processScreenData(const char* data);
 void handleAtmegaData();
 void processAtmegaCommand(const char* cmd);
-void processHaltEvent(int value);
-void handleScreenData();
-void processScreenJson(const char* json);
+void UpdateScreen(char prefix, int value);
+// ====== interface web server ========================
 void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions);
-void handleWebRequest();
 void fetchMachineData();
-void updateMachineState(const JsonDocument& doc);
-void serialTask(void* parameter);
-void scheduleRestart();
-String generateSessionToken();
-bool isAuthenticated();
-void resetMDNS();
-void updateScreen(char prefix, int value);
-void refreshScreenNow();
+void queueWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions);
+void handleWebRequest();
+// ======= local web page and local web server =========
+void handleWebServer();
+void broadcastMachineState();
 String processor(const String& var);
-bool isApiReachable();
+String generateSessionToken();
+void resetMDNS();
+// ======= wifi provisionning =========================
+void setupWiFi();
 
-void setup() {
-  // Initialize serial communications
+
+void setup(void) {
   Serial.begin(115200);
-  // Initialize pins
+  atmegaSerial.begin(38400, SERIAL_8N1, ESP32_RXD0, ESP32_TXD0);
+  screenSerial.begin(115200, SERIAL_8N1, CYD_RXD, CYD_TXD);
+  // indicator LED for wifi connectivity
   pinMode(39, OUTPUT);
   digitalWrite(39, LOW);
 
-
-  atmegaSerial.begin(38400, SERIAL_8N1, ESP32_RXD0, ESP32_TXD0);
-  screenSerial.begin(9600, SERIAL_8N1, CYD_RXD, CYD_TXD);
-  delay(100);
-
-  // Initialize I2C
   Wire.setPins(I2C_SDA, I2C_SCL);
   Wire.begin();
+
   delay(1000);
   // Load configuration from Preferences
   preferences.begin("app-config", true);
@@ -197,8 +184,9 @@ void setup() {
   sessionToken = preferences.getString("session_token", "");
   preferences.end();
 
+  host = "machine" + String(MACHINE_ID);
   // Create FreeRTOS tasks
-  xTaskCreatePinnedToCore(serialTask, "SerialTask", 12000, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(serialTask, "SerialTask", 12000, NULL, 1, NULL, 0);
 
   for (int attempt = 0; attempt < 3 && !powerFailDetected; attempt++) {
     atmegaSerial.println("S1");
@@ -212,118 +200,469 @@ void setup() {
 
     if (powerFailDetected) {
       Serial.printf(" Received 'F1' on attempt %d → Power fail confirmed!\n", attempt + 1);
-      state.fCommandTimestamp = millis();
-      delay(SAFETY_BUFFER_MS);  // 60-second delay only on real power fail
+      state.powerfailTimestamp = millis();
+      delay(endPointPowerupTime);  // delay only on real power fail
     }
   }
   if (!powerFailDetected) {
     Serial.printf(" No F1 after 3 attempts → warm restart (no power fail)\n", millis() / 1000.0);
   }
-
-  // Proceed to WiFi setup
   setupWiFi();
-  // Attach WiFi event handler
-  WiFi.onEvent(handleWiFiEvent);
-  // setup websocket
-  webSocket.begin();
-  webSocket.enableHeartbeat(30000, 3000, 2);
-  webSocket.onEvent([](uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-    switch (type) {
-      case WStype_CONNECTED:
-        Serial.printf(F("[WS] Client #%u connected → accepting EVERYONE (debug mode)\n"), num);
-        // Optional: you can also print the client's IP for better debugging
-        Serial.printf(F("[WS] Client #%u IP: %s\n"), num, webSocket.remoteIP(num).toString().c_str());
-
-        // Force full refresh by resetting last sent data
-        lastSentData = DashboardData{};  // This zeros/clears all fields
-        // Immediately send current dashboard state to the newly connected client
-        sendDashboardUpdate();
-        break;
-
-      case WStype_DISCONNECTED:
-        Serial.printf(F("[WS] Client #%u disconnected\n"), num);
-        break;
-      case WStype_TEXT:
-        // Optional: if you want to see what the client is sending
-        Serial.printf(F("[WS] Client #%u sent: %.*s\n"), num, length, payload);
-        // If you later implement client→server messages (commands, auth, etc.)
-        // you can process them here
-        break;
-
-      case WStype_BIN:
-        Serial.printf(F("[WS] Client #%u sent binary data (%u bytes)\n"), num, length);
-        break;
-
-      case WStype_ERROR:
-        Serial.printf(F("[WS] Client #%u error occurred!\n"), num);
-        break;
-
-      case WStype_FRAGMENT_TEXT_START:
-      case WStype_FRAGMENT_BIN_START:
-      case WStype_FRAGMENT:
-      case WStype_FRAGMENT_FIN:
-        // Fragmented messages - usually rare in simple dashboards
-        break;
-      default:
-        Serial.printf(F("[WS] Client #%u unknown event type: %d\n"), num, type);
-        break;
-    }
-  });
-  // Set mDNS hostname
-  host = "machine" + String(MACHINE_ID);
   Serial.printf("Loaded configuration - API URL: %s, Machine ID: %u, mDNS Hostname: %s.local\n", API_BASE_URL.c_str(), MACHINE_ID, host.c_str());
-  if (MDNS.begin(host.c_str())) {
-    Serial.printf(F("mDNS started: %s.local\n"), host.c_str());
-    MDNS.addService("http", "tcp", 80);
-    MDNS.addServiceTxt("http", "tcp", "dev", "NsighTex");
-    MDNS.addServiceTxt("http", "tcp", "id", String(MACHINE_ID));
-    MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
-  } else {
-    Serial.printf(F("mDNS begin failed!\n"));
-  }
 }
-void loop() {
-  server.handleClient();
-  webSocket.loop();
-  scheduleRestart();
-  handleScreenI2C();
-  if (powerFailDetected && state.wifiConnected && isApiReachable() && !httpState.active) {
-    unsigned long downtime = (millis() - state.fCommandTimestamp + SAFETY_BUFFER_MS) / 1000;
-    sendWebRequest("0", MACHINE_ID, 19, 0, downtime);
-    powerFailDetected = false;
-  }
-  static unsigned long lastLog = 0;
-  if (millis() - lastLog >= 60000) {
-    if (WiFi.status() != WL_CONNECTED || !isApiReachable()) {
-      Serial.printf(F("Stale WiFi detected (API unreachable)! RSSI: %d dBm, IP: %s. Forcing reconnect...\n"), WiFi.RSSI(), WiFi.localIP().toString().c_str());
-      wifiState.reconnecting = true;
-      setupWiFi();
-    }
-    fetchMachineData();
-
-    uint32_t totalHeap = ESP.getHeapSize();
-    uint32_t freeHeap = ESP.getFreeHeap();
-    uint32_t minFreeHeap = ESP.getMinFreeHeap();
-    uint32_t usedHeap = totalHeap - freeHeap;
-
-    float heapUsedPercent = (float)usedHeap / totalHeap * 100.0f;
-    float heapFreePercent = (float)freeHeap / totalHeap * 100.0f;
-    float minFreePercent = totalHeap > 0 ? (float)minFreeHeap / totalHeap * 100.0f : 0.0f;
-
-    Serial.printf(F("-Heap → Total: %u  Used: %u  Free: %u  MinEver: %u bytes\n"), totalHeap, usedHeap, freeHeap, minFreeHeap);
-    Serial.printf(F("-     →            Used: %.1f%%   Free: %.1f%%   MinEver: %.1f%%\n"), heapUsedPercent, heapFreePercent, minFreePercent);
-
-    lastLog = millis();
-  }
+void loop(void) {
 }
 void serialTask(void* parameter) {
   for (;;) {
     handleScreenData();
-    vTaskDelay(1 / portTICK_PERIOD_MS);
     handleAtmegaData();
-    vTaskDelay(10 / portTICK_PERIOD_MS);  // Yield for 10ms
+    sendScreenCommand();
+    if (!httpState.active && !pendingWebRequests.empty() && state.wifiConnected) {
+      handleWebRequest();
+    }
+    vTaskDelay(30 / portTICK_PERIOD_MS);  // Yield for 10ms
   }
 }
+
+//========== Data from screen ====================
+void handleScreenData() {
+  while (screenSerial.available()) {
+    char c = screenSerial.read();
+    switch (rxState) {
+      case RxState::IDLE:
+      case RxState::WAITING_FOR_START:
+        if (c == '<') {
+          // Start of a possible command/marker
+          String marker = screenSerial.readStringUntil('>');  // still blocking but very rare (only on '<')
+          marker.trim();                                      // safety
+          if (marker == "START") {
+            rxState = RxState::RECEIVING_JSON;
+            screenBufPos = 0;
+            screenBuffer[0] = '\0';
+            Serial.println("Screen: START received");
+          } else if (marker == "END" && rxState == RxState::RECEIVING_JSON) {
+            rxState = RxState::IDLE;
+            Serial.println("Screen: Unexpected END");
+          }
+        }
+        break;
+      case RxState::RECEIVING_JSON:
+        if (c == '<') {
+          // Possible start of END marker — peek ahead without consuming too much
+          String marker = screenSerial.readStringUntil('>');
+          marker.trim();
+          if (marker == "END") {
+            screenBuffer[screenBufPos] = '\0';  // null-terminate
+            Serial.printf("Received from screen (%d bytes): %s\n", screenBufPos, screenBuffer);
+            processScreenData(screenBuffer);
+            rxState = RxState::IDLE;
+          } else {
+            if (screenBufPos < sizeof(screenBuffer) - 2) {
+              screenBuffer[screenBufPos++] = '<';
+            }
+            for (char mc : marker) {
+              if (screenBufPos < sizeof(screenBuffer) - 2) {
+                screenBuffer[screenBufPos++] = mc;
+              }
+            }
+            if (screenBufPos < sizeof(screenBuffer) - 1) {
+              screenBuffer[screenBufPos++] = '>';
+            }
+          }
+        } else if (screenBufPos < sizeof(screenBuffer) - 1) {
+          // Normal JSON character
+          screenBuffer[screenBufPos++] = c;
+        } else {
+          // Buffer overflow protection
+          Serial.println("Screen RX buffer overflow!");
+          rxState = RxState::IDLE;
+        }
+        break;
+    }
+  }
+}
+void processScreenData(const char* data) {
+  Serial.printf("RAW: %s\n", data);
+
+  char buffer[200];
+  strncpy(buffer, data, sizeof(buffer));
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  char* token = strtok(buffer, ",");
+
+  char* cmd = NULL;
+  char* value = NULL;
+  char* opid = NULL;
+
+  while (token != NULL) {
+    char* colon = strchr(token, ':');
+    if (colon) {
+      *colon = '\0';
+      char* key = token;
+      char* val = colon + 1;
+
+      if (strcmp(key, "cmd") == 0) cmd = val;
+      else if (strcmp(key, "value") == 0) value = val;
+      else if (strcmp(key, "OpID") == 0) opid = val;
+    }
+    token = strtok(NULL, ",");
+  }
+  if (!cmd) return;
+
+  Serial.printf("CMD: %s | VALUE: %s | OpID: %s\n", cmd, value ? value : "NULL", opid ? opid : "NULL");
+
+  if (strcmp(cmd, "Stage") == 0 && value) {
+    state.stageCode = atoi(value);
+    sendWebRequest(opid, MACHINE_ID, state.stageCode, 0, 0);
+    switch (state.stageCode) {
+      case 103: currentStage = ENCANTRAGE; break;
+      case 106: currentStage = ENCANTRAGE_PARTIEL; break;
+      case 104: currentStage = FIN_ENCANTRAGE; break;
+      case 105: currentStage = NOUAGE; break;
+      case 107: currentStage = PIQUAGE; break;
+      case 109: currentStage = OURDISSAGE; break;
+      case 111: currentStage = ENSOUPLAGE; break;
+      case 112: currentStage = FIN_ENSOUPLAGE; break;
+      default: printf("there is no stage that meets this Stage code\n");
+    }
+    Serial.printf("Stage: %d\n", currentStage);
+  } else if (strcmp(cmd, "Halt") == 0 && value) {
+    state.stopCode = atoi(value);
+    sendWebRequest(opid, MACHINE_ID, state.stopCode, 0, 0);
+    if (state.stopCode == 146 || state.stopCode == 147 || state.stopCode == 115) {
+      state.onRepaire = true;
+    } else {
+      state.onRepaire = false;
+    }
+  } else if (strcmp(cmd, "machID") == 0 && value) {
+    int id = atoi(value);
+    if (id >= 0 && id <= 255) {
+      MACHINE_ID = id;
+      preferences.begin("app-config", false);
+      preferences.putUChar("machine_id", id);
+      preferences.end();
+    }
+  } else if (strcmp(cmd, "URL") == 0 && value) {
+    String url = value;
+    if (url.startsWith("http://") || url.startsWith("https://")) {
+      API_BASE_URL = url;
+      preferences.begin("app-config", false);
+      preferences.putString("api_url", url);
+      preferences.end();
+    }
+  } else if (strcmp(cmd, "Data") == 0) {
+    UpdateScreen('N', MACHINE_ID);
+    UpdateScreen('O', state.stageCode);
+    UpdateScreen('X', state.wifiConnected == true ? 1 : 0);
+    UpdateScreen('H', state.stopCode);
+  } else if (strcmp(cmd, "Portal") == 0) {
+    Serial.println("open wifi provesioning Portal");
+  }
+}
+
+//========== Data from the sensors==========================
+void handleAtmegaData() {
+  static size_t bufferIndex = 0;
+  while (atmegaSerial.available()) {
+    char c = atmegaSerial.read();
+    if (c == '\n' || c == '\r') {
+      if (bufferIndex == 0) continue;
+      commandBuffer[bufferIndex] = '\0';
+      Serial.printf("Atmega → ESP: %s\n", commandBuffer);
+      char prefix = commandBuffer[0];
+      int value = (bufferIndex > 1) ? atoi(commandBuffer + 1) : 0;
+      if (prefix == 'F') {
+        powerFailDetected = true;
+        Serial.println("Power fail forced!");
+      } else if (prefix == 'R' || prefix == 'M' || prefix == 'S' || prefix == 'A') {
+        UpdateScreen(prefix, value);
+        if (prefix == 'M') {
+          if (value >= state.beamLength + 10) {
+            state.windSection++;
+            UpdateScreen('Y', state.windSection);
+            atmegaSerial.println("R1");
+          }
+        }
+      } else {
+        processAtmegaCommand(commandBuffer);
+      }
+      bufferIndex = 0;
+    } else if (bufferIndex < BUFFER_SIZE - 1) {
+      commandBuffer[bufferIndex++] = c;
+    } else {
+      Serial.println("Atmega buffer overflow!");
+      bufferIndex = 0;
+    }
+  }
+}
+void processAtmegaCommand(const char* cmd) {
+  if (cmd == nullptr || strlen(cmd) == 0) return;
+  char prefix = cmd[0];
+  int value = 0;
+  if (strlen(cmd) > 1) { value = atoi(cmd + 1); }
+  Serial.printf("Processing Atmega command: %c with value %d\n", prefix, value);
+  switch (prefix) {
+    case 'H':
+      if (state.onRepaire) {
+      } else {
+        state.stopCode = value;
+        sendWebRequest("0", MACHINE_ID, state.stopCode, 0, 0);
+      }
+      Serial.printf("Stop code received: %d\n", value);
+      break;
+    case 'L':
+      sendWebRequest("0", MACHINE_ID, 94, 0, value);
+      Serial.printf("chunk Length per minute %d\n", value);
+      break;
+    default: Serial.printf("Unknown command from Atmega: %s\n", cmd); break;
+  }
+
+  // Now send to screen using the new signature
+  UpdateScreen(prefix, value);
+}
+
+//========== Update screen Data display ====================
+void UpdateScreen(char prefix, int value) {
+  if (prefix == '\0') return;
+
+  // Build the command string like "M1234" or "R0" or "A999"
+  char cmd[16];
+  snprintf(cmd, sizeof(cmd), "%c%d", prefix, value);
+
+  String commandStr = cmd;
+
+  // Prevent flooding the queue with identical consecutive commands
+  if (!screenCommandQueue.empty() && screenCommandQueue.back() == commandStr) {
+    return;
+  }
+
+  // Limit queue size to avoid memory issues
+  if (screenCommandQueue.size() >= 25) {
+    screenCommandQueue.pop();
+    Serial.println("Warning: Screen command queue full - dropped oldest");
+  }
+
+  screenCommandQueue.push(std::move(commandStr));
+
+  // debug
+  // Serial.printf("Queued for screen: %s\n", cmd);
+}
+void sendScreenCommand() {
+  if (screenCommandQueue.empty()) return;
+
+  String cmd = screenCommandQueue.front();
+  screenCommandQueue.pop();
+
+  Wire.beginTransmission(SCREEN_I2C_ADDR);
+  Wire.write((const uint8_t*)cmd.c_str(), cmd.length());
+  Wire.write('\n');
+  uint8_t error = Wire.endTransmission();
+
+  if (error != 0) {
+    Serial.printf("I2C Error (%d) sending: %s\n", error, cmd.c_str());
+
+    // Recovery attempt
+    Wire.end();  // release the bus
+    delay(10);
+    Wire.begin();  // re-init (or Wire.begin(I2C_SDA, I2C_SCL) if needed)
+    // Optional: small delay before next attempt
+    vTaskDelay(5 / portTICK_PERIOD_MS);
+  } else {
+    // Serial.printf("Sent to screen (I2C): %s\n", cmd.c_str());  // uncomment only for debug
+  }
+}
+
+//========== Handle server and coude data exchange =========
+void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions) {
+  if (!state.wifiConnected || WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("WiFi not connected → queuing request"));
+    queueWebRequest(operatorID, machineID, haltCode, position, revolutions);
+    return;
+  }
+
+  if (httpState.active) {
+    Serial.println(F("HTTP busy → queuing request"));
+    queueWebRequest(operatorID, machineID, haltCode, position, revolutions);
+    return;
+  }
+
+  // Ready to send immediately
+  if (!httpState.http) {
+    httpState.http = new HTTPClient();
+  }
+
+  httpState.isFetchMachineData = false;
+  httpState.active = true;
+  httpState.retryCount = 0;
+  httpState.startTime = millis();
+  snprintf(httpState.url, sizeof(httpState.url), "%sRecording_Events_Api.php", API_BASE_URL.c_str());
+  httpState.http->setTimeout(httpState.HTTP_TIMEOUT_MS);
+  httpState.http->setConnectTimeout(5000);
+  httpState.http->begin(httpState.url);
+  httpState.http->addHeader("Content-Type", "application/json");
+  httpState.http->addHeader("User-Agent", "Machine" + String(MACHINE_ID));
+  httpState.http->addHeader("Connection", "close");
+
+  StaticJsonDocument<300> doc;
+  doc["idOperator"] = operatorID ? operatorID : "0";
+  doc["idMachine"] = machineID;
+  doc["codeStop"] = haltCode;
+  doc["idDevice"] = machineID;
+  doc["reposition"] = position;
+  doc["revolution"] = revolutions;
+  doc["iPAddress"] = WiFi.localIP().toString();
+
+  httpState.jsonPayload.clear();
+  serializeJson(doc, httpState.jsonPayload);
+
+  Serial.printf(F("Sending web request: %s\n"), httpState.jsonPayload.c_str());
+
+  handleWebRequest();
+}
+void fetchMachineData() {
+  if (!state.wifiConnected || WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("WiFi not connected → skipping fetch"));
+    return;
+  }
+  if (millis() - httpState.lastFetchTime < 5000) {
+    return;
+  }
+  if (httpState.active || !pendingWebRequests.empty()) {
+    Serial.printf(F("Skipping fetch (active=%d, queue=%d)\n"), httpState.active, pendingWebRequests.size());
+    return;
+  }
+
+  httpState.lastFetchTime = millis();
+
+  if (!httpState.http) {
+    httpState.http = new HTTPClient();
+  }
+
+  httpState.isFetchMachineData = true;
+  httpState.active = true;
+  httpState.retryCount = 0;
+
+  snprintf(httpState.url, sizeof(httpState.url), "%sGet_Speed_and_Perfommence.php", API_BASE_URL.c_str());
+
+  httpState.http->setTimeout(httpState.HTTP_TIMEOUT_MS);
+  httpState.http->setConnectTimeout(5000);
+  httpState.http->begin(httpState.url);
+  httpState.http->addHeader("Content-Type", "application/json");
+  httpState.http->addHeader("User-Agent", "ESP32-Machine/" + String(MACHINE_ID));
+  httpState.http->addHeader("Connection", "close");
+
+  StaticJsonDocument<100> doc;
+  doc["idMachine"] = MACHINE_ID;
+  httpState.jsonPayload.clear();
+  serializeJson(doc, httpState.jsonPayload);
+
+  Serial.printf(F("Fetching machine data: %s\n"), httpState.jsonPayload.c_str());
+
+  handleWebRequest();
+}
+void handleWebRequest() {
+  if (!httpState.http) return;
+  const int maxAttempts = httpState.isFetchMachineData ? 1 : httpState.MAX_RETRIES;
+  bool success = false;
+
+  for (httpState.retryCount = 1; httpState.retryCount <= maxAttempts; ++httpState.retryCount) {
+    httpState.startTime = millis();
+
+    int responseCode = httpState.http->POST(httpState.jsonPayload);
+    String payload = httpState.http->getString();
+
+    Serial.printf(F("HTTP %s | Code: %d | Body: %s\n"), httpState.isFetchMachineData ? "FETCH" : "EVENT", responseCode, payload.c_str());
+
+    if (responseCode > 0) {
+      if (httpState.isFetchMachineData) {
+        StaticJsonDocument<300> responseDoc;
+        if (deserializeJson(responseDoc, payload) == DeserializationError::Ok) {
+          state.previousStopCode = responseDoc["LastCodeStop"].as<int>();
+          String label = responseDoc["LastCodeLabel"].as<String>();
+          state.performance = responseDoc["performance"].as<float>();
+          state.beamLength = responseDoc["speed"].as<int>();
+          state.stageCode = responseDoc["lainID"].as<int>();
+
+          if (state.previousStopCode >= 100) {
+            UpdateScreen('H', state.previousStopCode);
+            if (state.previousStopCode == 146 || state.previousStopCode == 147 || state.previousStopCode == 115) {
+              state.onRepaire = true;
+            }
+          }
+        }
+      }
+      success = true;
+      break;
+    } else {
+      Serial.printf(F("HTTP Error (Attempt %d/%d): %s\n"), httpState.retryCount, maxAttempts, httpState.http->errorToString(responseCode).c_str());
+      if (httpState.retryCount < maxAttempts) {
+        delay(1000);
+        httpState.http->end();
+        httpState.http->begin(httpState.url);
+        httpState.http->addHeader("Content-Type", "application/json");
+        httpState.http->addHeader("User-Agent", "Machine" + String(MACHINE_ID));
+      }
+    }
+  }
+
+  // Cleanup
+  if (httpState.http) {
+    httpState.http->end();
+    delete httpState.http;
+    httpState.http = nullptr;
+  }
+
+  httpState.active = false;
+  httpState.retryCount = 0;
+
+  // === Process next queued JSON payload if any ===
+  if (!pendingWebRequests.empty()) {
+    String nextJson = pendingWebRequests.front();
+    pendingWebRequests.pop();
+
+    Serial.printf(F("Processing queued request | Queue left: %d\n"), pendingWebRequests.size());
+    Serial.printf(F("Queued JSON: %s\n"), nextJson.c_str());
+
+    // Reuse the same httpState.jsonPayload for the next request
+    httpState.jsonPayload = nextJson;
+    httpState.isFetchMachineData = false;  // queued requests are always event type
+
+    // Re-prepare HTTPClient for the next request
+    if (!httpState.http) httpState.http = new HTTPClient();
+    snprintf(httpState.url, sizeof(httpState.url), "%sRecording_Events_Api.php", API_BASE_URL.c_str());
+    httpState.http->setTimeout(httpState.HTTP_TIMEOUT_MS);
+    httpState.http->setConnectTimeout(5000);
+    httpState.http->begin(httpState.url);
+    httpState.http->addHeader("Content-Type", "application/json");
+    httpState.http->addHeader("User-Agent", "Machine" + String(MACHINE_ID));
+    httpState.http->addHeader("Connection", "close");
+
+    handleWebRequest();  // recursive call to process the next one (safe because active=false now)
+  }
+}
+void queueWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions) {
+  if (pendingWebRequests.size() >= 20) {
+    pendingWebRequests.pop();
+    Serial.println(F("Request queue full - dropped oldest"));
+  }
+
+  StaticJsonDocument<300> doc;
+  doc["idOperator"] = operatorID ? operatorID : "0";
+  doc["idMachine"] = machineID;
+  doc["codeStop"] = haltCode;
+  doc["idDevice"] = machineID;
+  doc["reposition"] = position;
+  doc["revolution"] = revolutions;
+  doc["iPAddress"] = WiFi.localIP().toString();  // even if WiFi is down, we can store "0.0.0.0" or skip
+
+  String jsonStr;
+  serializeJson(doc, jsonStr);
+  pendingWebRequests.push(jsonStr);
+
+  Serial.printf(F("Request queued | Queue size: %d | HaltCode: %d\n"), pendingWebRequests.size(), haltCode);
+}
+
+// ========== Wifi provisionning =========================
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -343,855 +682,399 @@ void setupWiFi() {
   wm.setCleanConnect(true);  // Don't jump to portal immediately
 
   bool connected = false;
-  bool hasSavedCreds = (wm.getWiFiSSID() != "");
 
-  if (!hasSavedCreds) {
-    // No saved creds → open portal immediately (on power up)
-    Serial.printf(F("No saved WiFi credentials → starting config portal\n"));
-    connected = wm.startConfigPortal(apName.c_str(), "Nsight1234");
+  if (wm.getWiFiIsSaved()) {
+    Serial.println(F("Saved WiFi credentials found → trying to connect..."));
+    // Try to connect without opening portal first
+    wm.setConfigPortalTimeout(0);  // Disable portal during initial connect attempt
+    connected = wm.autoConnect(apName.c_str(), "Nsight1234");
+    if (!connected) {
+      Serial.println(F("Failed to connect to saved network → will open portal"));
+    }
   } else {
-    // Has saved creds → try to connect without portal
-    wm.setConfigPortalTimeout(0);                              // Disable auto portal
-    connected = wm.autoConnect(apName.c_str(), "Nsight1234");  // Will try connect, return false if fails, no portal
+    Serial.println(F("No saved WiFi credentials → opening config portal immediately"));
+    connected = wm.startConfigPortal(apName.c_str(), "Nsight1234");
   }
 
   if (connected) {
     Serial.printf(F("Connected! IP: %s\n"), WiFi.localIP().toString().c_str());
     state.wifiConnected = true;
     digitalWrite(39, 1);
-    updateScreen('X', 1);
-    // Save current lease as "static" if we don't have one yet
-    setupWebServer();
+    UpdateScreen('X', 1);
     fetchMachineData();
-    triggerPortal = false;
-    wifiSetupDone = true;
+    state.wifiSetupDone = true;
   } else {
-    updateScreen('X', 0);
+    UpdateScreen('X', 0);
     Serial.println("failed to connect");
-    wifiSetupDone = true;  // Still mark as done to allow periodic retries
+    state.wifiSetupDone = true;
   }
 }
-String generateSessionToken() {
-  String token = "";
-  const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-  for (int i = 0; i < 16; i++) {
-    token += alphanum[random(0, sizeof(alphanum) - 1)];
-  }
-  preferences.begin("app-config", false);
-  preferences.putString("session_token", token);
-  preferences.end();
-  return token;
-}
-bool isAuthenticated() {
-  if (server.hasArg("token")) {
-    String token = server.arg("token");
-    if (token == sessionToken && sessionToken != "") {
-      return true;
-    }
-  }
-  server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "Redirecting to login");
-  return false;
-}
-void resetMDNS() {
-  MDNS.end();
-  delay(100);  // Small delay
-  if (!MDNS.begin(host.c_str())) {
-    Serial.printf(F("Error setting up mDNS responder!\n"));
-  } else {
-    Serial.printf(F("mDNS responder started: %s .local \n"), host);
-    MDNS.addService("http", "tcp", 80);
-    // Optional: make it show up nicer in some browsers
-    MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
-  }
-}
-void setupWebServer() {
-  randomSeed(millis());
-  if (!MDNS.begin(host.c_str())) {
-    Serial.println("Error setting up MDNS responder!");
-    // while (1) vTaskDelay(1000 / portTICK_PERIOD_MS);
-  }
-  Serial.println("mDNS responder started");
-  if (webServerStarted) return;
-  webServerStarted = true;
-  server.on("/", HTTP_GET, []() {
-    sessionToken = "";
-    preferences.begin("app-config", false);
-    preferences.remove("session_token");
-    preferences.end();
 
-    String page = loginIndex;
-    page.replace("%MACHINE_ID%", String(MACHINE_ID));
-    server.send(200, "text/html", page);
-  });
-  server.on("/login", HTTP_POST, []() {
-    if (server.hasArg("plain")) {
-      StaticJsonDocument<200> doc;
-      DeserializationError error = deserializeJson(doc, server.arg("plain"));
-      if (error) {
-        server.send(400, "text/plain", String("Invalid JSON: ") + error.c_str());
-        return;
-      }
-      String username = doc["userid"] | "";
-      String password = doc["pwd"] | "";
-      if (username == "Nsight" && password == "Nsight17") {
-        sessionToken = generateSessionToken();
-        server.send(200, "text/plain", sessionToken);
-      } else {
-        server.send(401, "text/plain", "Unauthorized: Incorrect credentials");
-      }
-    } else {
-      server.send(400, "text/plain", "No login data provided");
-    }
-  });
-  server.on("/logout", HTTP_POST, []() {
-    sessionToken = "";
-    preferences.begin("app-config", false);
-    preferences.remove("session_token");
-    preferences.end();
-    resetMDNS();
-    server.send(200, "application/json", "{\"success\": true, \"message\": \"Logged out successfully\"}");
-  });
-  auto requireAuth = []() {
-    return isAuthenticated();
-  };
-  server.on("/serverIndex", HTTP_GET, [requireAuth]() {
-    if (!requireAuth()) return;
-    String page = serverIndex;
-    page.replace("%MACHINE_ID%", String(MACHINE_ID));
-    server.send(200, "text/html", page);
-  });
-  server.on("/config", HTTP_GET, [requireAuth]() {
-    if (!requireAuth()) return;
-    String page = configPage;
-    page.replace("%API_URL%", API_BASE_URL);
-    page.replace("%MACHINE_ID%", String(MACHINE_ID));
-    server.send(200, "text/html", page);
-  });
-  server.on("/sendCommand", HTTP_GET, [requireAuth]() {
-    if (!requireAuth()) return;
+//=========== Webserver functions =========================
+// void handleWebServer() {
+//   randomSeed(millis());
+//   if (!MDNS.begin(host.c_str())) {
+//     Serial.println("Error setting up MDNS responder!");
+//     // while (1) vTaskDelay(1000 / portTICK_PERIOD_MS);
+//   }
+//   Serial.println("mDNS responder started");
+//   if (webServerStarted) return;
+//   webServerStarted = true;
+//   server.on("/", HTTP_GET, []() {
+//     sessionToken = "";
+//     preferences.begin("app-config", false);
+//     preferences.remove("session_token");
+//     preferences.end();
 
-    String cmd = server.arg("cmd");
+//     String page = loginIndex;
+//     page.replace("%MACHINE_ID%", String(MACHINE_ID));
+//     server.send(200, "text/html", page);
+//   });
+//   server.on("/login", HTTP_POST, []() {
+//     if (server.hasArg("plain")) {
+//       StaticJsonDocument<200> doc;
+//       DeserializationError error = deserializeJson(doc, server.arg("plain"));
+//       if (error) {
+//         server.send(400, "text/plain", String("Invalid JSON: ") + error.c_str());
+//         return;
+//       }
+//       String username = doc["userid"] | "";
+//       String password = doc["pwd"] | "";
+//       if (username == "Nsight" && password == "Nsight17") {
+//         sessionToken = generateSessionToken();
+//         server.send(200, "text/plain", sessionToken);
+//       } else {
+//         server.send(401, "text/plain", "Unauthorized: Incorrect credentials");
+//       }
+//     } else {
+//       server.send(400, "text/plain", "No login data provided");
+//     }
+//   });
+//   server.on("/logout", HTTP_POST, []() {
+//     sessionToken = "";
+//     preferences.begin("app-config", false);
+//     preferences.remove("session_token");
+//     preferences.end();
+//     resetMDNS();
+//     server.send(200, "application/json", "{\"success\": true, \"message\": \"Logged out successfully\"}");
+//   });
+//   auto requireAuth = []() {
+//     return isAuthenticated();
+//   };
+//   server.on("/serverIndex", HTTP_GET, [requireAuth]() {
+//     if (!requireAuth()) return;
+//     String page = serverIndex;
+//     page.replace("%MACHINE_ID%", String(MACHINE_ID));
+//     server.send(200, "text/html", page);
+//   });
+//   server.on("/config", HTTP_GET, [requireAuth]() {
+//     if (!requireAuth()) return;
+//     String page = configPage;
+//     page.replace("%API_URL%", API_BASE_URL);
+//     page.replace("%MACHINE_ID%", String(MACHINE_ID));
+//     server.send(200, "text/html", page);
+//   });
+//   server.on("/sendCommand", HTTP_GET, [requireAuth]() {
+//     if (!requireAuth()) return;
 
-    if (cmd == "R" || cmd == "r") {  // Accept R or r
-      // Clear live data on ESP32 side
-      liveData.currentMeters = 0;
-      liveData.linearSpeed = 0.0f;
-      liveData.drumRPM = 0;
-      liveData.machineState = "normal_stop";
+//     String cmd = server.arg("cmd");
 
-      // Force immediate dashboard update
-      lastLiveSent = {};  // invalidate comparison
-      sendDashboardUpdate();
-      // updateScreen('H', 0);
-      updateScreen('M', 0);
-      // Send reset command to ATmega with explicit newline
-      atmegaSerial.print("R\n");  // use print + \n instead of println for clarity
-      Serial.println(">>> WEB RESET: Sent 'R\\n' to ATmega");
+//     if (cmd == "R" || cmd == "r") {  // Accept R or r
+//       // Clear live data on ESP32 side
+//       liveData.currentMeters = 0;
+//       liveData.linearSpeed = 0.0f;
+//       liveData.drumRPM = 0;
+//       liveData.machineState = "normal_stop";
 
-      server.send(200, "text/plain", "OK: Reset sent");
-    } else {
-      server.send(400, "text/plain", "Invalid command");
-    }
-  });
-  server.on(
-    "/saveConfig", HTTP_POST, [requireAuth]() {
-      if (!requireAuth()) return;
+//       // Force immediate dashboard update
+//       lastLiveSent = {};  // invalidate comparison
+//       sendDashboardUpdate();
+//       // updateScreen('H', 0);
+//       UpdateScreen('M', 0);
+//       // Send reset command to ATmega with explicit newline
+//       atmegaSerial.print("R\n");  // use print + \n instead of println for clarity
+//       Serial.println(">>> WEB RESET: Sent 'R\\n' to ATmega");
 
-      if (!server.hasArg("plain") || server.arg("plain").length() == 0) {
-        server.send(400, "text/plain", "No data sent");
-        return;
-      }
+//       server.send(200, "text/plain", "OK: Reset sent");
+//     } else {
+//       server.send(400, "text/plain", "Invalid command");
+//     }
+//   });
+//   server.on(
+//     "/saveConfig", HTTP_POST, [requireAuth]() {
+//       if (!requireAuth()) return;
 
-      String raw = server.arg("plain");
-      Serial.printf("saveConfig payload: %s\n", raw.c_str());
+//       if (!server.hasArg("plain") || server.arg("plain").length() == 0) {
+//         server.send(400, "text/plain", "No data sent");
+//         return;
+//       }
 
-      StaticJsonDocument<400> doc;
-      DeserializationError error = deserializeJson(doc, raw);
-      if (error) {
-        Serial.printf("JSON error: %s\n", error.c_str());
-        server.send(400, "text/plain", "Invalid JSON");
-        return;
-      }
+//       String raw = server.arg("plain");
+//       Serial.printf("saveConfig payload: %s\n", raw.c_str());
 
-      bool needRestart = false;
-      bool mdnsChanged = false;
+//       StaticJsonDocument<400> doc;
+//       DeserializationError error = deserializeJson(doc, raw);
+//       if (error) {
+//         Serial.printf("JSON error: %s\n", error.c_str());
+//         server.send(400, "text/plain", "Invalid JSON");
+//         return;
+//       }
 
-      // *** CRITICAL: Open Preferences for writing ***
-      preferences.begin("app-config", false);  // false = read/write mode
+//       bool needRestart = false;
+//       bool mdnsChanged = false;
 
-      if (doc.containsKey("api_url")) {
-        String url = doc["api_url"].as<String>();
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
-          preferences.end();
-          server.send(400, "text/plain", "API URL must start with http:// or https://");
-          return;
-        }
-        API_BASE_URL = url;
-        preferences.putString("api_url", url);
-        Serial.println("Updated API URL");
-      }
+//       // *** CRITICAL: Open Preferences for writing ***
+//       preferences.begin("app-config", false);  // false = read/write mode
 
-      if (doc.containsKey("machine_id")) {
-        int id = doc["machine_id"].as<int>();
-        if (id < 0 || id > 255) {
-          preferences.end();
-          server.send(400, "text/plain", "Machine ID must be 0-255");
-          return;
-        }
-        MACHINE_ID = id;
-        preferences.putUChar("machine_id", (uint8_t)id);
-        host = "machine" + String(MACHINE_ID);
-        mdnsChanged = true;
-        needRestart = true;
-        Serial.printf("Updated Machine ID to %d\n", id);
-      }
-      preferences.end();
+//       if (doc.containsKey("api_url")) {
+//         String url = doc["api_url"].as<String>();
+//         if (!url.startsWith("http://") && !url.startsWith("https://")) {
+//           preferences.end();
+//           server.send(400, "text/plain", "API URL must start with http:// or https://");
+//           return;
+//         }
+//         API_BASE_URL = url;
+//         preferences.putString("api_url", url);
+//         Serial.println("Updated API URL");
+//       }
 
-      // Apply mDNS change if needed
-      if (mdnsChanged) {
-        resetMDNS();
-      }
-      // Schedule restart if Machine ID changed
-      if (needRestart) {
-        restartTime = millis() + 3000;
-      }
+//       if (doc.containsKey("machine_id")) {
+//         int id = doc["machine_id"].as<int>();
+//         if (id < 0 || id > 255) {
+//           preferences.end();
+//           server.send(400, "text/plain", "Machine ID must be 0-255");
+//           return;
+//         }
+//         MACHINE_ID = id;
+//         preferences.putUChar("machine_id", (uint8_t)id);
+//         host = "machine" + String(MACHINE_ID);
+//         mdnsChanged = true;
+//         needRestart = true;
+//         Serial.printf("Updated Machine ID to %d\n", id);
+//       }
+//       preferences.end();
 
-      // Success response
-      StaticJsonDocument<200> resp;
-      resp["success"] = true;
-      resp["message"] = "Configuration saved successfully";
-      resp["newMachineId"] = MACHINE_ID;
-      resp["ipAddress"] = WiFi.localIP().toString();
+//       // Apply mDNS change if needed
+//       if (mdnsChanged) {
+//         resetMDNS();
+//       }
+//       // Schedule restart if Machine ID changed
+//       if (needRestart) {
+//         restartTime = millis() + 3000;
+//       }
 
-      String output;
-      serializeJson(resp, output);
-      server.send(200, "application/json", output);
+//       // Success response
+//       StaticJsonDocument<200> resp;
+//       resp["success"] = true;
+//       resp["message"] = "Configuration saved successfully";
+//       resp["newMachineId"] = MACHINE_ID;
+//       resp["ipAddress"] = WiFi.localIP().toString();
 
-      Serial.println("Configuration saved and committed to flash");
-    },
-    nullptr);
-  server.on("/reboot", HTTP_POST, [requireAuth]() {
-    if (!requireAuth()) {
-      server.send(401, "text/plain", "Unauthorized: Please log in");
-      return;
-    }
-    StaticJsonDocument<200> responseDoc;
-    responseDoc["success"] = true;
-    responseDoc["message"] = "Reboot initiated";
-    responseDoc["ipAddress"] = WiFi.localIP().toString();
-    String response;
-    serializeJson(responseDoc, response);
-    server.sendHeader("Connection", "close");
-    server.send(200, "application/json", response);
-    atmegaSerial.println("B1");
-    resetMDNS();
-    restartTime = millis() + 1000;  // Schedule restart
-  });
-  server.on(
-    "/update", HTTP_POST, [requireAuth]() {
-      if (!requireAuth()) {
-        server.send(401, "text/plain", "Unauthorized: Please log in");
-        return;
-      }
-      StaticJsonDocument<200> responseDoc;
-      responseDoc["success"] = !Update.hasError();
-      responseDoc["message"] = Update.hasError() ? "Firmware update failed" : "Firmware update successful";
-      responseDoc["ipAddress"] = WiFi.localIP().toString();
-      String response;
-      serializeJson(responseDoc, response);
-      server.sendHeader("Connection", "close");
-      server.send(200, "application/json", response);
-      updating = false;
-      restartTime = millis() + 1000;
-    },
-    [requireAuth]() {
-      if (!requireAuth()) {
-        server.send(401, "text/plain", "Unauthorized: Please log in");
-        return;
-      }
-      HTTPUpload& upload = server.upload();
-      if (upload.status == UPLOAD_FILE_START) {
-        updating = true;
-        memset(commandBuffer, 0, BUFFER_SIZE);
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-          Update.printError(Serial);
-          updating = false;
-        }
-      } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-          Update.printError(Serial);
-          updating = false;
-        }
-      } else if (upload.status == UPLOAD_FILE_END) {
-        if (Update.end(true)) {
-          preferences.begin("app-config", false);
-          preferences.remove("api_url");
-          preferences.remove("machine_id");
-          preferences.remove("max_distance_mm");
-          preferences.remove("strip_sensor_offset");
-          preferences.end();
-          ESP.restart();
-        } else {
-          Update.printError(Serial);
-          updating = false;
-        }
-      }
-    });
-  server.begin();
-  Serial.println("Web server started");
-}
-void handleWiFiEvent(WiFiEvent_t event) {
-  switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.printf(F(" WiFi STA connected to SSID: %s\n"), WiFi.SSID().c_str());
-      break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf(F(" WiFi got IP: %s, Gateway: %s"), WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
-      state.wifiConnected = true;
-      digitalWrite(39, 1);
-      updateScreen('X', 1);
-      setupWebServer();
-      fetchMachineData();
-      wifiState.reconnecting = false;
-      currentData.wifiConnected = true;
-      sendDashboardUpdate();
-      break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      {
-        WiFiEventInfo_t info = {};  // Zero-initialize
-        uint8_t reason = 0;         // Default
-        Serial.printf(F("WiFi disconnected (no detailed reason available in this core version)\n"));
-        state.wifiConnected = false;
-        digitalWrite(39, 0);
-        updateScreen('X', 0);
-        triggerPortal = false;
-        wifiState.reconnecting = false;
-        currentData.wifiConnected = false;
-        sendDashboardUpdate();
-        // Trigger reconnect immediately
-        setupWiFi();
+//       String output;
+//       serializeJson(resp, output);
+//       server.send(200, "application/json", output);
 
-        break;
-      }
-    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
-      Serial.printf(F("Lost IP - forcing disconnect/reconnect\n"));
-      setupWiFi();
-      break;
-  }
-}
-void handleAtmegaData() {
-  static size_t bufferIndex = 0;
-  while (atmegaSerial.available()) {
-    char c = atmegaSerial.read();
-    if (c == '\n' || c == '\r') {
-      if (bufferIndex == 0) continue;
-      commandBuffer[bufferIndex] = '\0';
-      char prefix = commandBuffer[0];
-      if (prefix == 'F') {
-        Serial.printf(" F1 received → FORCING POWER FAIL DETECTION!\n", millis() / 1000.0);
-        powerFailDetected = true;
-      } else if (prefix == 'R' || prefix == 'S') {
-        processAtmegaCommand(commandBuffer);
-      } else if (httpState.active || !state.wifiConnected) {
-        if (pendingAtmegaCommands.size() >= MAX_PENDING_COMMANDS) pendingAtmegaCommands.pop();
-        pendingAtmegaCommands.push(std::string(commandBuffer));
-      } else {
-        processAtmegaCommand(commandBuffer);
-        // atmegaSerial.println("A1");
-      }
-      bufferIndex = 0;
-    } else if (bufferIndex < BUFFER_SIZE - 1) {
-      commandBuffer[bufferIndex++] = c;
-    } else {
-      bufferIndex = 0;
-    }
-  }
-}
-void processAtmegaCommand(const char* cmd) {
-  char prefix = cmd[0];
-  String valStr = String(cmd + 1);
-  int value = valStr.toInt();
-  float fvalue = valStr.toFloat();
-  bool liveChanged = false;
-  Serial.print("received from Atmega328: ");
-  Serial.print(cmd);
-  Serial.println();
-  switch (prefix) {
-    case 'H':
-      {
-        String newState;
-        if (value == 0) newState = "running";
-        else if (value == 1) newState = "normal_stop";
-        else if (value == 2) newState = "chain_stop";
-        if (liveData.machineState != newState) {
-          liveData.machineState = newState;
-          liveChanged = true;
-        }
-        processHaltEvent(value);
-        break;
-      }
-    case 'M':
-      if (liveData.currentMeters != value) {
-        liveData.currentMeters = value;
-        liveChanged = true;
-      }
-      updateScreen('M', value);
-      break;
-    case 'S':
-      if (abs(liveData.linearSpeed - fvalue) > 0.01f) {
-        liveData.linearSpeed = fvalue;
-        liveChanged = true;
-      }
-      updateScreen('S', (int)(fvalue * 100));
-      break;
-    case 'R':
-      if (liveData.drumRPM != value) {
-        liveData.drumRPM = value;
-        liveChanged = true;
-      }
-      updateScreen('R', value);
-      break;
-    case 'L':
-      sendWebRequest("0", MACHINE_ID, 120, 0, value);
-      break;
-    case 'F':
-      if (!powerFailDetected) {
-        powerFailDetected = true;
-        Serial.printf(F(" Power fail confirmed — will log 60s downtime\n"), millis() / 1000.0);
-      }
-      break;
-  }
-  if (liveChanged) {
-    sendDashboardUpdate();
-  }
-}
-void processHaltEvent(int value) {
-  state.haltIssue = value;
-  sendDashboardUpdate();
-  if (state.isOperational) {
-    updateScreen('H', value);
-    if (value == 1)
-      sendWebRequest("0", MACHINE_ID, 101, 0, 0);
-    else if (value == 0)
-      sendWebRequest("0", MACHINE_ID, 100, 0, 0);
-    else
-      sendWebRequest("0", MACHINE_ID, value, 0, 0);
-    
-    updateScreen('H', value);
-    if (value == 0) {
-      state.lastHaltCode = 0;
-    }
-  } else if (state.resumeHaltCode) {
-    updateScreen('H', state.lastHaltCode);
-    state.resumeHaltCode = false;
-  }
-}
-void handleScreenData() {
-  static bool receiving = false;
-  static bool inJson = false;
+//       Serial.println("Configuration saved and committed to flash");
+//     },
+//     nullptr);
+//   server.on("/reboot", HTTP_POST, [requireAuth]() {
+//     if (!requireAuth()) {
+//       server.send(401, "text/plain", "Unauthorized: Please log in");
+//       return;
+//     }
+//     StaticJsonDocument<200> responseDoc;
+//     responseDoc["success"] = true;
+//     responseDoc["message"] = "Reboot initiated";
+//     responseDoc["ipAddress"] = WiFi.localIP().toString();
+//     String response;
+//     serializeJson(responseDoc, response);
+//     server.sendHeader("Connection", "close");
+//     server.send(200, "application/json", response);
+//     atmegaSerial.println("B1");
+//     resetMDNS();
+//     restartTime = millis() + 1000;  // Schedule restart
+//   });
+//   server.on(
+//     "/update", HTTP_POST, [requireAuth]() {
+//       if (!requireAuth()) {
+//         server.send(401, "text/plain", "Unauthorized: Please log in");
+//         return;
+//       }
+//       StaticJsonDocument<200> responseDoc;
+//       responseDoc["success"] = !Update.hasError();
+//       responseDoc["message"] = Update.hasError() ? "Firmware update failed" : "Firmware update successful";
+//       responseDoc["ipAddress"] = WiFi.localIP().toString();
+//       String response;
+//       serializeJson(responseDoc, response);
+//       server.sendHeader("Connection", "close");
+//       server.send(200, "application/json", response);
+//       updating = false;
+//       restartTime = millis() + 1000;
+//     },
+//     [requireAuth]() {
+//       if (!requireAuth()) {
+//         server.send(401, "text/plain", "Unauthorized: Please log in");
+//         return;
+//       }
+//       HTTPUpload& upload = server.upload();
+//       if (upload.status == UPLOAD_FILE_START) {
+//         updating = true;
+//         memset(commandBuffer, 0, BUFFER_SIZE);
+//         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+//           Update.printError(Serial);
+//           updating = false;
+//         }
+//       } else if (upload.status == UPLOAD_FILE_WRITE) {
+//         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+//           Update.printError(Serial);
+//           updating = false;
+//         }
+//       } else if (upload.status == UPLOAD_FILE_END) {
+//         if (Update.end(true)) {
+//           preferences.begin("app-config", false);
+//           preferences.remove("api_url");
+//           preferences.remove("machine_id");
+//           preferences.remove("max_distance_mm");
+//           preferences.remove("strip_sensor_offset");
+//           preferences.end();
+//           ESP.restart();
+//         } else {
+//           Update.printError(Serial);
+//           updating = false;
+//         }
+//       }
+//     });
+//   server.begin();
+//   Serial.println("Web server started");
+// }
+// void broadcastMachineState() {
+//   StaticJsonDocument<512> doc;
 
-  while (screenSerial.available()) {
-    char c = screenSerial.read();
-    if (c == '<') {
-      String marker = screenSerial.readStringUntil('>');  // Keep this String (infrequent)
-      if (marker == "START") {
-        receiving = true;
-        inJson = true;
-        screenBufPos = 0;
-        screenBuffer[0] = '\0';
-      } else if (marker == "END" && receiving) {
-        receiving = false;
-        inJson = false;
-        screenBuffer[screenBufPos] = '\0';  // Null-terminate
-        processScreenJson(screenBuffer);    // Pass char*
-      }
-    } else if (inJson && screenBufPos < sizeof(screenBuffer) - 1) {
-      screenBuffer[screenBufPos++] = c;
-    }
-  }
-}
-void processScreenJson(const char* json) {
-  StaticJsonDocument<200> doc;
-  DeserializationError error = deserializeJson(doc, json);
-  if (error == DeserializationError::Ok) {
-    const char* command = doc["command"];
-    if (!command) return;
-    Serial.printf(F(" Received Screen JSON Command: %s\n"), command);
-    if (strcmp(command, "REQ") == 0) {
-      const char* operatorID = doc["idOperator"];
-      int haltCode = doc["codeStop"];
-      uint16_t position = doc["reposition"];
-      uint16_t revolutions = doc["revolution"];
-      state.haltIssue = haltCode;
-      sendWebRequest(operatorID, MACHINE_ID, haltCode, position, revolutions);
-      if (haltCode >= 146 && haltCode <= 160) {
-        state.isOperational = false;
-        atmegaSerial.printf(F("P%d\n"), haltCode);
-      } else {
-        state.isOperational = true;
-        atmegaSerial.printf(F("P%d"), haltCode);
-      }
-    } else if (strcmp(command, "URL") == 0) {
-      const char* newUrl = doc["URL"];
-      if (newUrl && strlen(newUrl) > 0) {
-        String url = newUrl;
-        if (url.startsWith("http://") || url.startsWith("https://")) {
-          preferences.begin("app-config", false);
-          preferences.putString("api_url", url);
-          preferences.end();
-          API_BASE_URL = url;
-          fetchMachineData();
-        }
-      }
-    } else if (strcmp(command, "Portal") == 0) {
-      String apName = "Machine_" + String(MACHINE_ID);
-      triggerPortal = true;
-      wm.setTimeout(300);
-      WiFi.disconnect();
-      state.wifiConnected = false;
-      updateScreen('X', 0);
-      if (wm.startConfigPortal(apName.c_str(), "Nsight1234")) {
-        state.wifiConnected = true;
-        updateScreen('X', 1);
-        setupWebServer();
-        fetchMachineData();
-      } else {
-        setupWiFi();
-      }
-    } else if (strcmp(command, "IDmach") == 0) {
-      JsonVariant machineIdVariant = doc["machineID"];
-      if (!machineIdVariant.isNull()) {
-        int newMachineId = machineIdVariant.as<int>();
-        if (newMachineId >= 0 && newMachineId <= 255) {
-          preferences.begin("app-config", false);
-          preferences.putUChar("machine_id", newMachineId);
-          preferences.end();
-          MACHINE_ID = newMachineId;
-          host = "machine" + String(MACHINE_ID);
-          MDNS.setInstanceName(host.c_str());
-          setupWiFi();
-          setupWebServer();
-          fetchMachineData();
-        }
-      }
-    } else if (strcmp(command, "Data") == 0 && state.haltIssue == 0) {
-      screenRequested = true;
-      refreshScreenNow();
-    }
-  } else {
-    Serial.printf(F(" Screen JSON Deserialization Error: %s\n"), error.c_str());
-  }
-}
-void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions) {
-  if (!state.wifiConnected) {
-    Serial.printf(F(" Skipped sendWebRequest: No WiFi connection\n"), millis() / 1000.0);
-    setupWiFi();
-    return;
-  }
-  if (httpState.active) {
-    Serial.printf(F(" Skipped sendWebRequest: Previous request still active\n"), millis() / 1000.0);
-    return;
-  }
-  if (!httpState.active) httpState.retryCount = 0;
-  if (!httpState.http) { httpState.http = new HTTPClient(); }
-  httpState.isFetchMachineData = false;
-  httpState.active = true;
-  snprintf(httpState.url, sizeof(httpState.url), "%sRecording_Events_Api.php", API_BASE_URL.c_str());
-  httpState.http->setTimeout(HTTP_TIMEOUT_MS);
-  httpState.http->setConnectTimeout(5000);
-  httpState.http->begin(httpState.url);
-  httpState.http->addHeader("Content-Type", "application/json");
-  httpState.http->addHeader("User-Agent", "Machine" + String(MACHINE_ID));
-  httpState.http->addHeader("Connection", "close");
+//   doc["haltCode"] = state.stopCode;
+//   doc["prodStep"] = state.stageCode;
+//   doc["performance"] = state.performance;
+//   doc["currentMeters"] = state.currentMeters;
+//   doc["drumRPM"] = state.drumRevs;
+//   doc["linearSpeed"] = 0.0;  // calculate if you have speed
+//   doc["wifi"] = state.wifiConnected;
+//   // Add LastCodeLabel if you store it
 
-  StaticJsonDocument<300> doc;
-  doc["idOperator"] = operatorID ? operatorID : "0";
-  doc["idMachine"] = machineID;
-  doc["codeStop"] = haltCode;
-  doc["idDevice"] = machineID;
-  doc["reposition"] = position;
-  doc["revolution"] = revolutions;
-  doc["iPAddress"] = WiFi.localIP().toString();
-  serializeJson(doc, httpState.json);
+//   String json;
+//   serializeJson(doc, json);
+//   webSocket.broadcastTXT(json);
+// }
+// String generateSessionToken() {
+//   String token = "";
+//   const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+//   for (int i = 0; i < 16; i++) {
+//     token += alphanum[random(0, sizeof(alphanum) - 1)];
+//   }
+//   preferences.begin("app-config", false);
+//   preferences.putString("session_token", token);
+//   preferences.end();
+//   return token;
+// }
+// bool isAuthenticated() {
+//   if (server.hasArg("token")) {
+//     String token = server.arg("token");
+//     if (token == sessionToken && sessionToken != "") {
+//       return true;
+//     }
+//   }
+//   server.sendHeader("Location", "/");
+//   server.send(302, "text/plain", "Redirecting to login");
+//   return false;
+// }
+// void resetMDNS() {
+//   MDNS.end();
+//   delay(100);  // Small delay
+//   if (!MDNS.begin(host.c_str())) {
+//     Serial.printf(F("Error setting up mDNS responder!\n"));
+//   } else {
+//     Serial.printf(F("mDNS responder started: %s .local \n"), host);
+//     MDNS.addService("http", "tcp", 80);
+//     // Optional: make it show up nicer in some browsers
+//     MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
+//   }
+// }
+// void sendDashboardUpdate() {
+//   bool changed = currentData.changed(lastSentData);
 
-  Serial.printf(F(" sendWebRequest: %s\n"), httpState.json.c_str());
-  handleWebRequest();
-}
-void fetchMachineData() {
-  if (!state.wifiConnected) {
-    Serial.printf(F(" Skipped fetch Machine Data: No WiFi connection\n"), millis() / 1000.0);
-    setupWiFi();
-    return;
-  }
-  if (millis() - lastFetchTime < 5000) {
-    Serial.printf(F(" Skipped fetch Machine Data: Too frequent\n"), millis() / 1000.0);
-    return;
-  }
-  if (httpState.active || !pendingAtmegaCommands.empty()) {
-    Serial.printf(F(" Skipped fetch Machine Data: Prioritizing sendWebRequest (active=%d, queue size=%d)\n"),
-                  httpState.active, pendingAtmegaCommands.size());
-    return;
-  }
-  lastFetchTime = millis();
-  if (!httpState.active) httpState.retryCount = 0;
-  if (!httpState.http) { httpState.http = new HTTPClient(); }
-  httpState.isFetchMachineData = true;
-  httpState.active = true;
-  snprintf(httpState.url, sizeof(httpState.url), "%sGet_Speed_and_Perfommence.php", API_BASE_URL.c_str());
-  httpState.http->setTimeout(HTTP_TIMEOUT_MS);
-  httpState.http->setConnectTimeout(5000);
-  httpState.http->begin(httpState.url);
-  httpState.http->addHeader("Content-Type", "application/json");
-  httpState.http->addHeader("User-Agent", "ESP32-Machine/" + String(MACHINE_ID));
-  httpState.http->addHeader("Connection", "close");
+//   if (liveData.machineState != lastLiveSent.machineState || liveData.currentMeters != lastLiveSent.currentMeters || abs(liveData.linearSpeed - lastLiveSent.linearSpeed) > 0.01f || liveData.drumRPM != lastLiveSent.drumRPM) {
+//     changed = true;
+//   }
 
-  StaticJsonDocument<100> requestDoc;
-  requestDoc["idMachine"] = MACHINE_ID;
-  serializeJson(requestDoc, httpState.json);
+//   if (!changed) return;
 
-  Serial.printf(F(" fetch Machine Data - payload: %s\n"), httpState.json.c_str());
-  handleWebRequest();
-}
-void handleWebRequest() {
-  int maxAttempts = httpState.isFetchMachineData ? 1 : MAX_RETRIES;  // 3 for events, 1 for fetch
-  bool success = false;
+//   StaticJsonDocument<512> doc;
 
-  for (httpState.retryCount = 1; httpState.retryCount <= maxAttempts; ++httpState.retryCount) {
-    httpState.startTime = millis();
-    int responseCode = httpState.http->POST(httpState.json);
-    String payload = httpState.http->getString();
+//   // Original fields
+//   doc["speed"] = currentData.revolutions;
+//   doc["performance"] = roundf(currentData.performance * 10.0f) / 10.0f;
+//   doc["LastCodeStop"] = currentData.lastCodeStop;
+//   doc["LastCodeLabel"] = currentData.lastCodeLabel;
+//   doc["wifi"] = currentData.wifiConnected;
+//   doc["updating"] = updating;
 
-    Serial.printf(F(" HTTP %s Response Code: %d, Body: %s\n"), httpState.isFetchMachineData ? "FETCH" : "SEND", responseCode, payload.c_str());
+//   doc["currentProductionStep"] = lastProductionStepCode;  // e.g. 109
+//   doc["productionStepLabel"] = lastProductionStepLabel;   // e.g. "Ourdissage"
 
-    if (responseCode > 0) {
-      if (httpState.isFetchMachineData) {
-        StaticJsonDocument<300> responseDoc;
-        if (deserializeJson(responseDoc, payload) == DeserializationError::Ok) {
-          updateMachineState(responseDoc);
-        }
-      }
-      success = true;
-      break;  // Success → exit retry loop
-    } else {
-      Serial.printf(F(" HTTP Error (Attempt %d/%d): %s\n"), httpState.retryCount, maxAttempts, httpState.http->errorToString(responseCode).c_str());
-      if (httpState.retryCount < maxAttempts) {
-        delay(1000);  // Wait before retry
-        httpState.http->end();
-        httpState.http->begin(httpState.url);
-        httpState.http->addHeader("Content-Type", "application/json");
-        httpState.http->addHeader("User-Agent", "Machine" + String(MACHINE_ID));
-      }
-    }
-  }
-  // After loop (success or failure)
-  if (!success) {
-    Serial.printf(F(" HTTP request failed after %d attempts. Checking server reachability...\n"), maxAttempts);
-    if (!isApiReachable()) {
-      Serial.printf(F(" Server unreachable → forcing WiFi reconnect NOW\n"));
-      WiFi.disconnect(true);  // true = clear state
-      delay(200);             // Brief pause for lwIP cleanup
-      setupWiFi();
-      // Wait up to 15s for reconnect before continuing (non-blocking elsewhere)
-      unsigned long timeout = millis() + 15000;
-      while (WiFi.status() != WL_CONNECTED && millis() < timeout) {
-        delay(500);
-        Serial.printf(F("."));
-      }
-      Serial.printf(F("\n"));
-      Serial.printf(F(WiFi.status() == WL_CONNECTED ? " Reconnected!\n" : " Reconnect timed out\n"));
-    } else {
-      Serial.printf(F(" Server reachable but request failed → possible server-side issue\n"));
-    }
-  }
+//   // Ourdissoire live data
+//   doc["state"] = liveData.machineState;
+//   doc["currentMeters"] = liveData.currentMeters;
+//   doc["linearSpeed"] = roundf(liveData.linearSpeed * 100.0f) / 100.0f;
+//   doc["drumRPM"] = liveData.drumRPM;
 
-  if (httpState.http) {
-    httpState.http->end();
-    delete httpState.http;
-    httpState.http = nullptr;
-  }
-  httpState.active = false;
-  httpState.retryCount = 0;
-  // === NOW PROCESS NEXT QUEUED COMMAND (if any) ===
-  if (!pendingAtmegaCommands.empty()) {
-    const AtmegaCommand& cmd = pendingAtmegaCommands.front();
-    pendingAtmegaCommands.pop();
-    Serial.printf(" → Processing queued ATmega cmd: %s\n", cmd.data());
-    processAtmegaCommand(cmd.data());  // ← This will call sendWebRequest() → gets 3 attempts!
-    atmegaSerial.println("A1");
-  }
-}
-void updateMachineState(const JsonDocument& doc) {
-  state.lastHaltCode = doc["LastCodeStop"].as<int>();
-  String label = doc["LastCodeLabel"].as<String>();
-  state.performance = doc["performance"].as<float>();
-  state.lastCodeLabel = label;  // Store LastCodeLabel
+//   String json;
+//   serializeJson(doc, json);
+//   webSocket.broadcastTXT(json);
 
-  currentData.performance = doc["performance"].as<float>();
-  currentData.lastCodeStop = doc["LastCodeStop"].as<int>();
-  currentData.lastCodeLabel = doc["LastCodeLabel"].as<String>();
+//   lastSentData = currentData;
+//   lastLiveSent = liveData;
+// }
 
-  sendDashboardUpdate();
 
-  if (state.lastHaltCode > 0) {
-    updateScreen('H', state.lastHaltCode);
-    state.haltIssue = state.lastHaltCode;
-    atmegaSerial.printf("C%d\n", state.haltIssue);
-    state.resumeHaltCode = true;
-    if (state.lastHaltCode >= 46 && state.lastHaltCode <= 60) {
-      state.isOperational = false;
-      atmegaSerial.println("M1");
-    }
-  } else {
-    refreshScreenNow();
-  }
-}
-void handleScreenI2C() {
-  unsigned long now = millis();
-  // 1. Probe screen when we think it's dead (fast reconnect)
-  static unsigned long lastProbe = 0;
-  static bool lastScreenReady = false;
-  if (!screenReady && (now - lastProbe >= 1000)) {  // probe every 600ms when missing
-    lastProbe = now;
-    Wire.beginTransmission(SCREEN_I2C_ADDR);
-    screenReady = (Wire.endTransmission() == 0);
-  }
-  if (screenReady && !lastScreenReady) {  // ← New: detect transition to ready
-    Serial.printf(F("Screen detected after being unavailable → forcing refresh\n"));
-    refreshScreenNow();  // Force update on re-detection
-  }
-  lastScreenReady = screenReady;
-  // 2. Send next command if ready and 200ms passed
-  if (screenReady && !screenQueue.empty() && (now - lastI2CSentTime >= I2C_INTERVAL)) {
-    ScreenCommand cmd = screenQueue.front();
-    screenQueue.pop();
-
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%c%d\n", cmd.prefix, cmd.value);
-
-    Wire.beginTransmission(SCREEN_I2C_ADDR);
-    Wire.write((const uint8_t*)buf, strlen(buf));
-    uint8_t err = Wire.endTransmission();
-
-    if (err == 0) {
-      lastI2CSentTime = now;
-      if (I2C_DEBUG_LOG) Serial.printf(F(" → Screen: %c%d\n"), cmd.prefix, cmd.value);
-    } else {
-      screenReady = false;  // screen disappeared
-      if (screenQueue.size() >= 60) {
-        // drop oldest or newest
-        screenQueue.pop();
-      }
-      screenQueue.push(cmd);  // retry later
-      if (I2C_DEBUG_LOG) Serial.printf(F(" I2C failed (err=%d), retrying %c%d later\n"), err, cmd.prefix, cmd.value);
-    }
-  }
-}
+// ========= mescelineouce functions ======================
 void scheduleRestart() {
-  if (restartTime != 0 && millis() - restartTime < 5000) {
-  } else if (restartTime != 0) {
+  if (restartTime != 0 && millis() - restartTime >= 5000) {
     ESP.restart();
   }
 }
-void updateScreen(char prefix, int value) {
-  screenQueue.push({ prefix, value });
-  Serial.printf(F("sent to screen: %c%d"), prefix, value);
-}
-void refreshScreenNow() {
-  bool force = screenRequested;
-  screenRequested = false;
-  Serial.printf(F("Screan is updated\n"));
-  if (state.haltIssue != screenLast.halt || force) {
-    updateScreen('H', state.haltIssue);
-  }
-  if (state.revolutions != screenLast.speed || force) {
-    updateScreen('S', (int)state.revolutions);
-  }
-  if (fabs(state.performance - screenLast.perf) > 0.09f || force) {
-    updateScreen('P', int(round(state.performance * 10)));
-  }
-  if ((WiFi.status() == WL_CONNECTED ? 1 : 0) != screenLast.wifi || force) {
-    updateScreen('X', WiFi.status() == WL_CONNECTED ? 1 : 0);
-  }
-  if (MACHINE_ID != screenLast.machine || force) {
-    updateScreen('N', (int)MACHINE_ID);
-  }
-}
-void sendDashboardUpdate() {
-  bool changed = currentData.changed(lastSentData);
+// bool isApiReachable() {
+//   WiFiClient client;
+//   // Parse host/port (your code already has this)
+//   String url = API_BASE_URL;
+//   url.toLowerCase();
+//   int schemeEnd = url.indexOf("://");
+//   if (schemeEnd == -1) return false;
+//   String hostPart = url.substring(schemeEnd + 3);
+//   int pathStart = hostPart.indexOf('/');
+//   if (pathStart != -1) hostPart = hostPart.substring(0, pathStart);
+//   int portStart = hostPart.indexOf(':');
+//   String host = (portStart != -1) ? hostPart.substring(0, portStart) : hostPart;
+//   int port = (portStart != -1) ? hostPart.substring(portStart + 1).toInt() : 80;  // HTTP, not HTTPS
 
-  if (liveData.machineState != lastLiveSent.machineState || liveData.currentMeters != lastLiveSent.currentMeters || abs(liveData.linearSpeed - lastLiveSent.linearSpeed) > 0.01f || liveData.drumRPM != lastLiveSent.drumRPM) {
-    changed = true;
-  }
+//   client.setTimeout(3000);  // 3s timeout
+//   // Serial.printf(F(" Testing reachability: %s:%d\n"), host.c_str(), port);
+//   if (client.connect(host.c_str(), port)) {
+//     client.stop();
+//     Serial.printf(F(" Server reachable\n"));
+//     return true;
+//   }
+//   IPAddress gw = WiFi.gatewayIP();
+//   if (gw == IPAddress(0, 0, 0, 0) || WiFi.localIP() == IPAddress(0, 0, 0, 0) || WiFi.RSSI() == 0) {
+//     Serial.printf(F(" Invalid WiFi state (gw/IP/RSSI=0) → network issue\n"));
+//     return false;
+//   }
 
-  if (!changed) return;
-
-  StaticJsonDocument<512> doc;
-
-  // Original fields
-  doc["speed"] = currentData.revolutions;
-  doc["performance"] = roundf(currentData.performance * 10.0f) / 10.0f;
-  doc["LastCodeStop"] = currentData.lastCodeStop;
-  doc["LastCodeLabel"] = currentData.lastCodeLabel;
-  doc["wifi"] = currentData.wifiConnected;
-  doc["updating"] = updating;
-
-  doc["currentProductionStep"] = lastProductionStepCode;  // e.g. 109
-  doc["productionStepLabel"] = lastProductionStepLabel;   // e.g. "Ourdissage"
-
-  // Ourdissoire live data
-  doc["state"] = liveData.machineState;
-  doc["currentMeters"] = liveData.currentMeters;
-  doc["linearSpeed"] = roundf(liveData.linearSpeed * 100.0f) / 100.0f;
-  doc["drumRPM"] = liveData.drumRPM;
-
-  String json;
-  serializeJson(doc, json);
-  webSocket.broadcastTXT(json);
-
-  lastSentData = currentData;
-  lastLiveSent = liveData;
-}
-String processor(const String& var) {
-  if (var == "MACHINE_ID") return String(MACHINE_ID);
-  if (var == "API_URL") return API_BASE_URL;
-  return String();
-}
-bool isApiReachable() {
-  WiFiClient client;
-  // Parse host/port (your code already has this)
-  String url = API_BASE_URL;
-  url.toLowerCase();
-  int schemeEnd = url.indexOf("://");
-  if (schemeEnd == -1) return false;
-  String hostPart = url.substring(schemeEnd + 3);
-  int pathStart = hostPart.indexOf('/');
-  if (pathStart != -1) hostPart = hostPart.substring(0, pathStart);
-  int portStart = hostPart.indexOf(':');
-  String host = (portStart != -1) ? hostPart.substring(0, portStart) : hostPart;
-  int port = (portStart != -1) ? hostPart.substring(portStart + 1).toInt() : 80;  // HTTP, not HTTPS
-
-  client.setTimeout(3000);  // 3s timeout
-  // Serial.printf(F(" Testing reachability: %s:%d\n"), host.c_str(), port);
-  if (client.connect(host.c_str(), port)) {
-    client.stop();
-    Serial.printf(F(" Server reachable\n"));
-    return true;
-  }
-  IPAddress gw = WiFi.gatewayIP();
-  if (gw == IPAddress(0, 0, 0, 0) || WiFi.localIP() == IPAddress(0, 0, 0, 0) || WiFi.RSSI() == 0) {
-    Serial.printf(F(" Invalid WiFi state (gw/IP/RSSI=0) → network issue\n"));
-    return false;
-  }
-
-  client.setTimeout(2000);
-  Serial.printf(F(" Testing gateway: %s:80\n"), gw.toString().c_str());
-  if (client.connect(gw, 80)) {  // Or port 53 if your router uses DNS
-    client.stop();
-    Serial.printf(F(" Gateway reachable → server likely down (no WiFi reconnect needed)\n"));
-    return true;  // Treat as "reachable" for WiFi purposes
-  } else {
-    Serial.printf(F(" Gateway unreachable → WiFi/network issue\n"));
-    return false;
-  }
-}
+//   client.setTimeout(2000);
+//   Serial.printf(F(" Testing gateway: %s:80\n"), gw.toString().c_str());
+//   if (client.connect(gw, 80)) {  // Or port 53 if your router uses DNS
+//     client.stop();
+//     Serial.printf(F(" Gateway reachable → server likely down (no WiFi reconnect needed)\n"));
+//     return true;  // Treat as "reachable" for WiFi purposes
+//   } else {
+//     Serial.printf(F(" Gateway unreachable → WiFi/network issue\n"));
+//     return false;
+//   }
+// }
