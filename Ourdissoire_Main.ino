@@ -26,7 +26,7 @@ constexpr uint8_t SCREEN_I2C_ADDR = 0x08;  // screen address
 
 volatile bool powerFailDetected = false;                   // to detect powerfail
 String API_BASE_URL = "http://192.168.1.248:7272/DBLOG/";  // Default API URL
-uint8_t MACHINE_ID = 99;
+uint8_t MACHINE_ID = 98;
 String host;
 String sessionToken = "";
 constexpr int endPointPowerupTime = 60000UL;
@@ -130,6 +130,8 @@ struct ScreenLastSent {
 };
 DashboardData currentData;
 DashboardData lastSentData;
+uint16_t lastProductionStepCode = 0;
+String lastProductionStepLabel = "";
 
 WiFiManager wm;
 MachineState state;
@@ -161,9 +163,11 @@ void broadcastMachineState();
 String processor(const String& var);
 String generateSessionToken();
 void resetMDNS();
+bool isAuthenticated();
+void sendDashboardUpdate();
 // ======= wifi provisionning =========================
 void setupWiFi();
-
+void i2cScanner();
 
 void setup(void) {
   Serial.begin(115200);
@@ -175,18 +179,63 @@ void setup(void) {
 
   Wire.setPins(I2C_SDA, I2C_SCL);
   Wire.begin();
-
   delay(1000);
-  // Load configuration from Preferences
-  preferences.begin("app-config", true);
-  MACHINE_ID = preferences.getUChar("machine_id", MACHINE_ID);
+
+  i2cScanner();
+
+  // === Load / Initialize configuration from Preferences ===
+  preferences.begin("app-config", false);  // false = read/write mode (required for writing)
+  bool needsWrite = false;
+  if (!preferences.isKey("machine_id")) {
+    MACHINE_ID = 98;
+    preferences.putUChar("machine_id", MACHINE_ID);
+    Serial.println("NVS was empty → set default Machine ID = 99");
+    needsWrite = true;
+  }
+  if (!preferences.isKey("api_url") || preferences.getString("api_url").length() == 0) {
+    API_BASE_URL = "http://192.168.1.248:7272/DBLOG/";
+    preferences.putString("api_url", API_BASE_URL);
+    Serial.println("NVS was empty → set default API URL");
+    needsWrite = true;
+  }
+  if (!preferences.isKey("session_token") || preferences.getString("session_token").length() == 0) {
+    sessionToken = "";
+    preferences.putString("session_token", sessionToken);
+    Serial.println("NVS was empty → cleared session token");
+    needsWrite = true;
+  }
+
+  // Now safely read the values
+  MACHINE_ID = preferences.getUChar("machine_id", 99);
   API_BASE_URL = preferences.getString("api_url", API_BASE_URL);
   sessionToken = preferences.getString("session_token", "");
+
   preferences.end();
 
   host = "machine" + String(MACHINE_ID);
-  // Create FreeRTOS tasks
-  xTaskCreatePinnedToCore(serialTask, "SerialTask", 12000, NULL, 1, NULL, 0);
+  {
+    // === Pre-fill default WiFi credentials if nothing is saved ===
+    if (!wm.getWiFiIsSaved()) {
+      Serial.println("No WiFi credentials found → setting factory defaults");
+
+      const char* defaultSSID = host.c_str();
+      const char* defaultPass = "hikma1234";
+
+      // This forces WiFiManager to save the default credentials
+      bool saved = wm.autoConnect(defaultSSID, defaultPass);
+
+      if (saved) {
+        Serial.printf("Default credentials saved successfully → SSID: %s\n", defaultSSID);
+      } else {
+        Serial.println("Failed to save default WiFi credentials");
+      }
+    } else {
+      Serial.println("WiFi credentials already saved in storage");
+    }
+  }
+  // Create FreeRTOS task (run on Core 1 - recommended)
+  xTaskCreatePinnedToCore(serialTask, "SerialTask", 14000, NULL, 1, NULL, 1);
+
 
   for (int attempt = 0; attempt < 3 && !powerFailDetected; attempt++) {
     atmegaSerial.println("S1");
@@ -209,7 +258,63 @@ void setup(void) {
   }
   setupWiFi();
   Serial.printf("Loaded configuration - API URL: %s, Machine ID: %u, mDNS Hostname: %s.local\n", API_BASE_URL.c_str(), MACHINE_ID, host.c_str());
+
+  // setup websocket
+  webSocket.begin();
+  webSocket.enableHeartbeat(30000, 3000, 2);
+  webSocket.onEvent([](uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+      case WStype_CONNECTED:
+        Serial.printf(F("[WS] Client #%u connected → accepting EVERYONE (debug mode)\n"), num);
+        // Optional: you can also print the client's IP for better debugging
+        Serial.printf(F("[WS] Client #%u IP: %s\n"), num, webSocket.remoteIP(num).toString().c_str());
+
+        // Force full refresh by resetting last sent data
+        lastSentData = DashboardData{};  // This zeros/clears all fields
+        // Immediately send current dashboard state to the newly connected client
+        sendDashboardUpdate();
+        break;
+
+      case WStype_DISCONNECTED:
+        Serial.printf(F("[WS] Client #%u disconnected\n"), num);
+        break;
+      case WStype_TEXT:
+        // Optional: if you want to see what the client is sending
+        Serial.printf(F("[WS] Client #%u sent: %.*s\n"), num, length, payload);
+        // If you later implement client→server messages (commands, auth, etc.)
+        // you can process them here
+        break;
+
+      case WStype_BIN:
+        Serial.printf(F("[WS] Client #%u sent binary data (%u bytes)\n"), num, length);
+        break;
+
+      case WStype_ERROR:
+        Serial.printf(F("[WS] Client #%u error occurred!\n"), num);
+        break;
+
+      case WStype_FRAGMENT_TEXT_START:
+      case WStype_FRAGMENT_BIN_START:
+      case WStype_FRAGMENT:
+      case WStype_FRAGMENT_FIN:
+        // Fragmented messages - usually rare in simple dashboards
+        break;
+      default:
+        Serial.printf(F("[WS] Client #%u unknown event type: %d\n"), num, type);
+        break;
+    }
+  });
+  if (MDNS.begin(host.c_str())) {
+    Serial.printf(F("mDNS started: %s.local\n"), host.c_str());
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addServiceTxt("http", "tcp", "dev", "NsighTex");
+    MDNS.addServiceTxt("http", "tcp", "id", String(MACHINE_ID));
+    MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
+  } else {
+    Serial.printf(F("mDNS begin failed!\n"));
+  }
 }
+
 void loop(void) {
 }
 void serialTask(void* parameter) {
@@ -453,23 +558,20 @@ void sendScreenCommand() {
   String cmd = screenCommandQueue.front();
   screenCommandQueue.pop();
 
-  Wire.beginTransmission(SCREEN_I2C_ADDR);
+  // Force clean state before every write
+  Wire.end();
+  delayMicroseconds(100);
+  Wire.begin();  // re-init
+
+  Wire.beginTransmission(SCREEN_I2C_ADDR);  // 0x08
   Wire.write((const uint8_t*)cmd.c_str(), cmd.length());
   Wire.write('\n');
-  uint8_t error = Wire.endTransmission();
+  uint8_t error = Wire.endTransmission(true);  // true = send stop
 
   if (error != 0) {
-    Serial.printf("I2C Error (%d) sending: %s\n", error, cmd.c_str());
-
-    // Recovery attempt
-    Wire.end();  // release the bus
-    delay(10);
-    Wire.begin();  // re-init (or Wire.begin(I2C_SDA, I2C_SCL) if needed)
-    // Optional: small delay before next attempt
-    vTaskDelay(5 / portTICK_PERIOD_MS);
-  } else {
-    // Serial.printf("Sent to screen (I2C): %s\n", cmd.c_str());  // uncomment only for debug
+    Serial.printf("I2C Error (%d) sending '%s'\n", error, cmd.c_str());
   }
+  // else success (you can uncomment a print if you want confirmation)
 }
 
 //========== Handle server and coude data exchange =========
@@ -668,371 +770,372 @@ void setupWiFi() {
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
   WiFi.setSleep(false);
-  digitalWrite(39, 0);  // LED on
+
+  digitalWrite(39, LOW);
+
   String apName = "Machine" + String(MACHINE_ID);
-  wm.setConfigPortalTimeout(180);  // 3 minutes max portal
-  wm.setConnectTimeout(15);        // Wait 15s per attempt
-  wm.setConnectRetries(4);         // Try 4 times before giving up
+  String apPass = "Nsight1234";  // Portal password
+
+  wm.setConfigPortalTimeout(180);
+  wm.setConnectTimeout(15);
+  wm.setConnectRetries(4);
   wm.setSaveConfigCallback([]() {
-    Serial.printf(F("WiFi credentials saved\n"));
+    Serial.println(F("WiFi credentials saved by user"));
   });
-  // CRITICAL: This forces WiFiManager to try saved credentials first
+
   wm.setShowInfoErase(false);
   wm.setShowInfoUpdate(false);
-  wm.setCleanConnect(true);  // Don't jump to portal immediately
+  wm.setCleanConnect(true);
 
   bool connected = false;
 
   if (wm.getWiFiIsSaved()) {
     Serial.println(F("Saved WiFi credentials found → trying to connect..."));
-    // Try to connect without opening portal first
-    wm.setConfigPortalTimeout(0);  // Disable portal during initial connect attempt
-    connected = wm.autoConnect(apName.c_str(), "Nsight1234");
-    if (!connected) {
-      Serial.println(F("Failed to connect to saved network → will open portal"));
-    }
+    wm.setConfigPortalTimeout(0);  // Do not open portal during first try
+    connected = wm.autoConnect(apName.c_str(), apPass.c_str());
   } else {
-    Serial.println(F("No saved WiFi credentials → opening config portal immediately"));
-    connected = wm.startConfigPortal(apName.c_str(), "Nsight1234");
+    Serial.println(F("No saved credentials → opening config portal"));
+    connected = wm.startConfigPortal(apName.c_str(), apPass.c_str());
   }
 
   if (connected) {
-    Serial.printf(F("Connected! IP: %s\n"), WiFi.localIP().toString().c_str());
+    Serial.printf(F("✅ WiFi Connected! IP: %s\n"), WiFi.localIP().toString().c_str());
     state.wifiConnected = true;
-    digitalWrite(39, 1);
+    digitalWrite(39, HIGH);
     UpdateScreen('X', 1);
+    handleWebServer();
     fetchMachineData();
-    state.wifiSetupDone = true;
   } else {
+    Serial.println("❌ WiFi connection failed or portal timed out");
+    state.wifiConnected = false;
     UpdateScreen('X', 0);
-    Serial.println("failed to connect");
-    state.wifiSetupDone = true;
   }
+
+  state.wifiSetupDone = true;
 }
 
 //=========== Webserver functions =========================
-// void handleWebServer() {
-//   randomSeed(millis());
-//   if (!MDNS.begin(host.c_str())) {
-//     Serial.println("Error setting up MDNS responder!");
-//     // while (1) vTaskDelay(1000 / portTICK_PERIOD_MS);
-//   }
-//   Serial.println("mDNS responder started");
-//   if (webServerStarted) return;
-//   webServerStarted = true;
-//   server.on("/", HTTP_GET, []() {
-//     sessionToken = "";
-//     preferences.begin("app-config", false);
-//     preferences.remove("session_token");
-//     preferences.end();
+void handleWebServer() {
+  randomSeed(millis());
+  if (!MDNS.begin(host.c_str())) {
+    Serial.println("Error setting up MDNS responder!");
+    // while (1) vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+  Serial.println("mDNS responder started");
+  if (webServerStarted) return;
+  webServerStarted = true;
+  server.on("/", HTTP_GET, []() {
+    sessionToken = "";
+    preferences.begin("app-config", false);
+    preferences.remove("session_token");
+    preferences.end();
 
-//     String page = loginIndex;
-//     page.replace("%MACHINE_ID%", String(MACHINE_ID));
-//     server.send(200, "text/html", page);
-//   });
-//   server.on("/login", HTTP_POST, []() {
-//     if (server.hasArg("plain")) {
-//       StaticJsonDocument<200> doc;
-//       DeserializationError error = deserializeJson(doc, server.arg("plain"));
-//       if (error) {
-//         server.send(400, "text/plain", String("Invalid JSON: ") + error.c_str());
-//         return;
-//       }
-//       String username = doc["userid"] | "";
-//       String password = doc["pwd"] | "";
-//       if (username == "Nsight" && password == "Nsight17") {
-//         sessionToken = generateSessionToken();
-//         server.send(200, "text/plain", sessionToken);
-//       } else {
-//         server.send(401, "text/plain", "Unauthorized: Incorrect credentials");
-//       }
-//     } else {
-//       server.send(400, "text/plain", "No login data provided");
-//     }
-//   });
-//   server.on("/logout", HTTP_POST, []() {
-//     sessionToken = "";
-//     preferences.begin("app-config", false);
-//     preferences.remove("session_token");
-//     preferences.end();
-//     resetMDNS();
-//     server.send(200, "application/json", "{\"success\": true, \"message\": \"Logged out successfully\"}");
-//   });
-//   auto requireAuth = []() {
-//     return isAuthenticated();
-//   };
-//   server.on("/serverIndex", HTTP_GET, [requireAuth]() {
-//     if (!requireAuth()) return;
-//     String page = serverIndex;
-//     page.replace("%MACHINE_ID%", String(MACHINE_ID));
-//     server.send(200, "text/html", page);
-//   });
-//   server.on("/config", HTTP_GET, [requireAuth]() {
-//     if (!requireAuth()) return;
-//     String page = configPage;
-//     page.replace("%API_URL%", API_BASE_URL);
-//     page.replace("%MACHINE_ID%", String(MACHINE_ID));
-//     server.send(200, "text/html", page);
-//   });
-//   server.on("/sendCommand", HTTP_GET, [requireAuth]() {
-//     if (!requireAuth()) return;
+    String page = loginIndex;
+    page.replace("%MACHINE_ID%", String(MACHINE_ID));
+    server.send(200, "text/html", page);
+  });
+  server.on("/login", HTTP_POST, []() {
+    if (server.hasArg("plain")) {
+      StaticJsonDocument<200> doc;
+      DeserializationError error = deserializeJson(doc, server.arg("plain"));
+      if (error) {
+        server.send(400, "text/plain", String("Invalid JSON: ") + error.c_str());
+        return;
+      }
+      String username = doc["userid"] | "";
+      String password = doc["pwd"] | "";
+      if (username == "Nsight" && password == "Nsight17") {
+        sessionToken = generateSessionToken();
+        server.send(200, "text/plain", sessionToken);
+      } else {
+        server.send(401, "text/plain", "Unauthorized: Incorrect credentials");
+      }
+    } else {
+      server.send(400, "text/plain", "No login data provided");
+    }
+  });
+  server.on("/logout", HTTP_POST, []() {
+    sessionToken = "";
+    preferences.begin("app-config", false);
+    preferences.remove("session_token");
+    preferences.end();
+    resetMDNS();
+    server.send(200, "application/json", "{\"success\": true, \"message\": \"Logged out successfully\"}");
+  });
+  auto requireAuth = []() {
+    return isAuthenticated();
+  };
+  server.on("/serverIndex", HTTP_GET, [requireAuth]() {
+    if (!requireAuth()) return;
+    String page = serverIndex;
+    page.replace("%MACHINE_ID%", String(MACHINE_ID));
+    server.send(200, "text/html", page);
+  });
+  server.on("/config", HTTP_GET, [requireAuth]() {
+    if (!requireAuth()) return;
+    String page = configPage;
+    page.replace("%API_URL%", API_BASE_URL);
+    page.replace("%MACHINE_ID%", String(MACHINE_ID));
+    server.send(200, "text/html", page);
+  });
+  server.on("/sendCommand", HTTP_GET, [requireAuth]() {
+    if (!requireAuth()) return;
 
-//     String cmd = server.arg("cmd");
+    String cmd = server.arg("cmd");
 
-//     if (cmd == "R" || cmd == "r") {  // Accept R or r
-//       // Clear live data on ESP32 side
-//       liveData.currentMeters = 0;
-//       liveData.linearSpeed = 0.0f;
-//       liveData.drumRPM = 0;
-//       liveData.machineState = "normal_stop";
+    if (cmd == "R" || cmd == "r") {  // Accept R or r
+      // Clear live data on ESP32 side
+      liveData.currentMeters = 0;
+      liveData.linearSpeed = 0.0f;
+      liveData.drumRPM = 0;
+      liveData.machineState = "normal_stop";
 
-//       // Force immediate dashboard update
-//       lastLiveSent = {};  // invalidate comparison
-//       sendDashboardUpdate();
-//       // updateScreen('H', 0);
-//       UpdateScreen('M', 0);
-//       // Send reset command to ATmega with explicit newline
-//       atmegaSerial.print("R\n");  // use print + \n instead of println for clarity
-//       Serial.println(">>> WEB RESET: Sent 'R\\n' to ATmega");
+      // Force immediate dashboard update
+      lastLiveSent = {};  // invalidate comparison
+      sendDashboardUpdate();
+      // updateScreen('H', 0);
+      UpdateScreen('M', 0);
+      // Send reset command to ATmega with explicit newline
+      atmegaSerial.print("R\n");  // use print + \n instead of println for clarity
+      Serial.println(">>> WEB RESET: Sent 'R\\n' to ATmega");
 
-//       server.send(200, "text/plain", "OK: Reset sent");
-//     } else {
-//       server.send(400, "text/plain", "Invalid command");
-//     }
-//   });
-//   server.on(
-//     "/saveConfig", HTTP_POST, [requireAuth]() {
-//       if (!requireAuth()) return;
+      server.send(200, "text/plain", "OK: Reset sent");
+    } else {
+      server.send(400, "text/plain", "Invalid command");
+    }
+  });
+  server.on(
+    "/saveConfig", HTTP_POST, [requireAuth]() {
+      if (!requireAuth()) return;
 
-//       if (!server.hasArg("plain") || server.arg("plain").length() == 0) {
-//         server.send(400, "text/plain", "No data sent");
-//         return;
-//       }
+      if (!server.hasArg("plain") || server.arg("plain").length() == 0) {
+        server.send(400, "text/plain", "No data sent");
+        return;
+      }
 
-//       String raw = server.arg("plain");
-//       Serial.printf("saveConfig payload: %s\n", raw.c_str());
+      String raw = server.arg("plain");
+      Serial.printf("saveConfig payload: %s\n", raw.c_str());
 
-//       StaticJsonDocument<400> doc;
-//       DeserializationError error = deserializeJson(doc, raw);
-//       if (error) {
-//         Serial.printf("JSON error: %s\n", error.c_str());
-//         server.send(400, "text/plain", "Invalid JSON");
-//         return;
-//       }
+      StaticJsonDocument<400> doc;
+      DeserializationError error = deserializeJson(doc, raw);
+      if (error) {
+        Serial.printf("JSON error: %s\n", error.c_str());
+        server.send(400, "text/plain", "Invalid JSON");
+        return;
+      }
 
-//       bool needRestart = false;
-//       bool mdnsChanged = false;
+      bool needRestart = false;
+      bool mdnsChanged = false;
 
-//       // *** CRITICAL: Open Preferences for writing ***
-//       preferences.begin("app-config", false);  // false = read/write mode
+      // *** CRITICAL: Open Preferences for writing ***
+      preferences.begin("app-config", false);  // false = read/write mode
 
-//       if (doc.containsKey("api_url")) {
-//         String url = doc["api_url"].as<String>();
-//         if (!url.startsWith("http://") && !url.startsWith("https://")) {
-//           preferences.end();
-//           server.send(400, "text/plain", "API URL must start with http:// or https://");
-//           return;
-//         }
-//         API_BASE_URL = url;
-//         preferences.putString("api_url", url);
-//         Serial.println("Updated API URL");
-//       }
+      if (doc.containsKey("api_url")) {
+        String url = doc["api_url"].as<String>();
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+          preferences.end();
+          server.send(400, "text/plain", "API URL must start with http:// or https://");
+          return;
+        }
+        API_BASE_URL = url;
+        preferences.putString("api_url", url);
+        Serial.println("Updated API URL");
+      }
 
-//       if (doc.containsKey("machine_id")) {
-//         int id = doc["machine_id"].as<int>();
-//         if (id < 0 || id > 255) {
-//           preferences.end();
-//           server.send(400, "text/plain", "Machine ID must be 0-255");
-//           return;
-//         }
-//         MACHINE_ID = id;
-//         preferences.putUChar("machine_id", (uint8_t)id);
-//         host = "machine" + String(MACHINE_ID);
-//         mdnsChanged = true;
-//         needRestart = true;
-//         Serial.printf("Updated Machine ID to %d\n", id);
-//       }
-//       preferences.end();
+      if (doc.containsKey("machine_id")) {
+        int id = doc["machine_id"].as<int>();
+        if (id < 0 || id > 255) {
+          preferences.end();
+          server.send(400, "text/plain", "Machine ID must be 0-255");
+          return;
+        }
+        MACHINE_ID = id;
+        preferences.putUChar("machine_id", (uint8_t)id);
+        host = "machine" + String(MACHINE_ID);
+        mdnsChanged = true;
+        needRestart = true;
+        Serial.printf("Updated Machine ID to %d\n", id);
+      }
+      preferences.end();
 
-//       // Apply mDNS change if needed
-//       if (mdnsChanged) {
-//         resetMDNS();
-//       }
-//       // Schedule restart if Machine ID changed
-//       if (needRestart) {
-//         restartTime = millis() + 3000;
-//       }
+      // Apply mDNS change if needed
+      if (mdnsChanged) {
+        resetMDNS();
+      }
+      // Schedule restart if Machine ID changed
+      if (needRestart) {
+        restartTime = millis() + 3000;
+      }
 
-//       // Success response
-//       StaticJsonDocument<200> resp;
-//       resp["success"] = true;
-//       resp["message"] = "Configuration saved successfully";
-//       resp["newMachineId"] = MACHINE_ID;
-//       resp["ipAddress"] = WiFi.localIP().toString();
+      // Success response
+      StaticJsonDocument<200> resp;
+      resp["success"] = true;
+      resp["message"] = "Configuration saved successfully";
+      resp["newMachineId"] = MACHINE_ID;
+      resp["ipAddress"] = WiFi.localIP().toString();
 
-//       String output;
-//       serializeJson(resp, output);
-//       server.send(200, "application/json", output);
+      String output;
+      serializeJson(resp, output);
+      server.send(200, "application/json", output);
 
-//       Serial.println("Configuration saved and committed to flash");
-//     },
-//     nullptr);
-//   server.on("/reboot", HTTP_POST, [requireAuth]() {
-//     if (!requireAuth()) {
-//       server.send(401, "text/plain", "Unauthorized: Please log in");
-//       return;
-//     }
-//     StaticJsonDocument<200> responseDoc;
-//     responseDoc["success"] = true;
-//     responseDoc["message"] = "Reboot initiated";
-//     responseDoc["ipAddress"] = WiFi.localIP().toString();
-//     String response;
-//     serializeJson(responseDoc, response);
-//     server.sendHeader("Connection", "close");
-//     server.send(200, "application/json", response);
-//     atmegaSerial.println("B1");
-//     resetMDNS();
-//     restartTime = millis() + 1000;  // Schedule restart
-//   });
-//   server.on(
-//     "/update", HTTP_POST, [requireAuth]() {
-//       if (!requireAuth()) {
-//         server.send(401, "text/plain", "Unauthorized: Please log in");
-//         return;
-//       }
-//       StaticJsonDocument<200> responseDoc;
-//       responseDoc["success"] = !Update.hasError();
-//       responseDoc["message"] = Update.hasError() ? "Firmware update failed" : "Firmware update successful";
-//       responseDoc["ipAddress"] = WiFi.localIP().toString();
-//       String response;
-//       serializeJson(responseDoc, response);
-//       server.sendHeader("Connection", "close");
-//       server.send(200, "application/json", response);
-//       updating = false;
-//       restartTime = millis() + 1000;
-//     },
-//     [requireAuth]() {
-//       if (!requireAuth()) {
-//         server.send(401, "text/plain", "Unauthorized: Please log in");
-//         return;
-//       }
-//       HTTPUpload& upload = server.upload();
-//       if (upload.status == UPLOAD_FILE_START) {
-//         updating = true;
-//         memset(commandBuffer, 0, BUFFER_SIZE);
-//         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-//           Update.printError(Serial);
-//           updating = false;
-//         }
-//       } else if (upload.status == UPLOAD_FILE_WRITE) {
-//         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-//           Update.printError(Serial);
-//           updating = false;
-//         }
-//       } else if (upload.status == UPLOAD_FILE_END) {
-//         if (Update.end(true)) {
-//           preferences.begin("app-config", false);
-//           preferences.remove("api_url");
-//           preferences.remove("machine_id");
-//           preferences.remove("max_distance_mm");
-//           preferences.remove("strip_sensor_offset");
-//           preferences.end();
-//           ESP.restart();
-//         } else {
-//           Update.printError(Serial);
-//           updating = false;
-//         }
-//       }
-//     });
-//   server.begin();
-//   Serial.println("Web server started");
-// }
-// void broadcastMachineState() {
-//   StaticJsonDocument<512> doc;
+      Serial.println("Configuration saved and committed to flash");
+    },
+    nullptr);
+  server.on("/reboot", HTTP_POST, [requireAuth]() {
+    if (!requireAuth()) {
+      server.send(401, "text/plain", "Unauthorized: Please log in");
+      return;
+    }
+    StaticJsonDocument<200> responseDoc;
+    responseDoc["success"] = true;
+    responseDoc["message"] = "Reboot initiated";
+    responseDoc["ipAddress"] = WiFi.localIP().toString();
+    String response;
+    serializeJson(responseDoc, response);
+    server.sendHeader("Connection", "close");
+    server.send(200, "application/json", response);
+    atmegaSerial.println("B1");
+    resetMDNS();
+    restartTime = millis() + 1000;  // Schedule restart
+  });
+  server.on(
+    "/update", HTTP_POST, [requireAuth]() {
+      if (!requireAuth()) {
+        server.send(401, "text/plain", "Unauthorized: Please log in");
+        return;
+      }
+      StaticJsonDocument<200> responseDoc;
+      responseDoc["success"] = !Update.hasError();
+      responseDoc["message"] = Update.hasError() ? "Firmware update failed" : "Firmware update successful";
+      responseDoc["ipAddress"] = WiFi.localIP().toString();
+      String response;
+      serializeJson(responseDoc, response);
+      server.sendHeader("Connection", "close");
+      server.send(200, "application/json", response);
+      updating = false;
+      restartTime = millis() + 1000;
+    },
+    [requireAuth]() {
+      if (!requireAuth()) {
+        server.send(401, "text/plain", "Unauthorized: Please log in");
+        return;
+      }
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        updating = true;
+        memset(commandBuffer, 0, BUFFER_SIZE);
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+          updating = false;
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Update.printError(Serial);
+          updating = false;
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+          preferences.begin("app-config", false);
+          preferences.remove("api_url");
+          preferences.remove("machine_id");
+          preferences.remove("max_distance_mm");
+          preferences.remove("strip_sensor_offset");
+          preferences.end();
+          ESP.restart();
+        } else {
+          Update.printError(Serial);
+          updating = false;
+        }
+      }
+    });
+  server.begin();
+  Serial.println("Web server started");
+}
+void broadcastMachineState() {
+  StaticJsonDocument<512> doc;
 
-//   doc["haltCode"] = state.stopCode;
-//   doc["prodStep"] = state.stageCode;
-//   doc["performance"] = state.performance;
-//   doc["currentMeters"] = state.currentMeters;
-//   doc["drumRPM"] = state.drumRevs;
-//   doc["linearSpeed"] = 0.0;  // calculate if you have speed
-//   doc["wifi"] = state.wifiConnected;
-//   // Add LastCodeLabel if you store it
+  doc["haltCode"] = state.stopCode;
+  doc["prodStep"] = state.stageCode;
+  doc["performance"] = state.performance;
+  doc["currentMeters"] = state.currentMeters;
+  doc["drumRPM"] = state.drumRevs;
+  doc["linearSpeed"] = 0.0;  // calculate if you have speed
+  doc["wifi"] = state.wifiConnected;
+  // Add LastCodeLabel if you store it
 
-//   String json;
-//   serializeJson(doc, json);
-//   webSocket.broadcastTXT(json);
-// }
-// String generateSessionToken() {
-//   String token = "";
-//   const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-//   for (int i = 0; i < 16; i++) {
-//     token += alphanum[random(0, sizeof(alphanum) - 1)];
-//   }
-//   preferences.begin("app-config", false);
-//   preferences.putString("session_token", token);
-//   preferences.end();
-//   return token;
-// }
-// bool isAuthenticated() {
-//   if (server.hasArg("token")) {
-//     String token = server.arg("token");
-//     if (token == sessionToken && sessionToken != "") {
-//       return true;
-//     }
-//   }
-//   server.sendHeader("Location", "/");
-//   server.send(302, "text/plain", "Redirecting to login");
-//   return false;
-// }
-// void resetMDNS() {
-//   MDNS.end();
-//   delay(100);  // Small delay
-//   if (!MDNS.begin(host.c_str())) {
-//     Serial.printf(F("Error setting up mDNS responder!\n"));
-//   } else {
-//     Serial.printf(F("mDNS responder started: %s .local \n"), host);
-//     MDNS.addService("http", "tcp", 80);
-//     // Optional: make it show up nicer in some browsers
-//     MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
-//   }
-// }
-// void sendDashboardUpdate() {
-//   bool changed = currentData.changed(lastSentData);
+  String json;
+  serializeJson(doc, json);
+  webSocket.broadcastTXT(json);
+}
+String generateSessionToken() {
+  String token = "";
+  const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  for (int i = 0; i < 16; i++) {
+    token += alphanum[random(0, sizeof(alphanum) - 1)];
+  }
+  preferences.begin("app-config", false);
+  preferences.putString("session_token", token);
+  preferences.end();
+  return token;
+}
+bool isAuthenticated() {
+  if (server.hasArg("token")) {
+    String token = server.arg("token");
+    if (token == sessionToken && sessionToken != "") {
+      return true;
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "Redirecting to login");
+  return false;
+}
+void resetMDNS() {
+  MDNS.end();
+  delay(100);  // Small delay
+  if (!MDNS.begin(host.c_str())) {
+    Serial.printf(F("Error setting up mDNS responder!\n"));
+  } else {
+    Serial.printf(F("mDNS responder started: %s .local \n"), host);
+    MDNS.addService("http", "tcp", 80);
+    // Optional: make it show up nicer in some browsers
+    MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
+  }
+}
+void sendDashboardUpdate() {
+  bool changed = currentData.changed(lastSentData);
 
-//   if (liveData.machineState != lastLiveSent.machineState || liveData.currentMeters != lastLiveSent.currentMeters || abs(liveData.linearSpeed - lastLiveSent.linearSpeed) > 0.01f || liveData.drumRPM != lastLiveSent.drumRPM) {
-//     changed = true;
-//   }
+  if (liveData.machineState != lastLiveSent.machineState || liveData.currentMeters != lastLiveSent.currentMeters || abs(liveData.linearSpeed - lastLiveSent.linearSpeed) > 0.01f || liveData.drumRPM != lastLiveSent.drumRPM) {
+    changed = true;
+  }
 
-//   if (!changed) return;
+  if (!changed) return;
 
-//   StaticJsonDocument<512> doc;
+  StaticJsonDocument<512> doc;
 
-//   // Original fields
-//   doc["speed"] = currentData.revolutions;
-//   doc["performance"] = roundf(currentData.performance * 10.0f) / 10.0f;
-//   doc["LastCodeStop"] = currentData.lastCodeStop;
-//   doc["LastCodeLabel"] = currentData.lastCodeLabel;
-//   doc["wifi"] = currentData.wifiConnected;
-//   doc["updating"] = updating;
+  // Original fields
+  doc["speed"] = currentData.revolutions;
+  doc["performance"] = roundf(currentData.performance * 10.0f) / 10.0f;
+  doc["LastCodeStop"] = currentData.lastCodeStop;
+  doc["LastCodeLabel"] = currentData.lastCodeLabel;
+  doc["wifi"] = currentData.wifiConnected;
+  doc["updating"] = updating;
 
-//   doc["currentProductionStep"] = lastProductionStepCode;  // e.g. 109
-//   doc["productionStepLabel"] = lastProductionStepLabel;   // e.g. "Ourdissage"
+  doc["currentProductionStep"] = lastProductionStepCode;  // e.g. 109
+  doc["productionStepLabel"] = lastProductionStepLabel;   // e.g. "Ourdissage"
 
-//   // Ourdissoire live data
-//   doc["state"] = liveData.machineState;
-//   doc["currentMeters"] = liveData.currentMeters;
-//   doc["linearSpeed"] = roundf(liveData.linearSpeed * 100.0f) / 100.0f;
-//   doc["drumRPM"] = liveData.drumRPM;
+  // Ourdissoire live data
+  doc["state"] = liveData.machineState;
+  doc["currentMeters"] = liveData.currentMeters;
+  doc["linearSpeed"] = roundf(liveData.linearSpeed * 100.0f) / 100.0f;
+  doc["drumRPM"] = liveData.drumRPM;
 
-//   String json;
-//   serializeJson(doc, json);
-//   webSocket.broadcastTXT(json);
+  String json;
+  serializeJson(doc, json);
+  webSocket.broadcastTXT(json);
 
-//   lastSentData = currentData;
-//   lastLiveSent = liveData;
-// }
-
+  lastSentData = currentData;
+  lastLiveSent = liveData;
+}
 
 // ========= mescelineouce functions ======================
 void scheduleRestart() {
@@ -1040,6 +1143,28 @@ void scheduleRestart() {
     ESP.restart();
   }
 }
+void i2cScanner() {
+  Serial.println("\n=== I2C Scanner ===");
+  int nDevices = 0;
+  for (uint8_t address = 8; address < 120; address++) {  // start from 0x08, skip reserved
+    Wire.beginTransmission(address);
+    uint8_t error = Wire.endTransmission();
+
+    if (error == 0) {
+      Serial.printf("I2C device found at address 0x%02X\n", address);
+      nDevices++;
+    } else if (error == 4) {
+      Serial.printf("Unknown error at address 0x%02X\n", address);
+    }
+  }
+  if (nDevices == 0) {
+    Serial.println("No I2C devices found");
+  } else {
+    Serial.printf("Found %d device(s)\n", nDevices);
+  }
+  Serial.println("Scan finished.\n");
+}
+
 // bool isApiReachable() {
 //   WiFiClient client;
 //   // Parse host/port (your code already has this)
