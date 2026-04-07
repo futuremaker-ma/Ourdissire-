@@ -168,6 +168,7 @@ void sendDashboardUpdate();
 // ======= wifi provisionning =========================
 void setupWiFi();
 void i2cScanner();
+bool isApiReachable();
 
 void setup(void) {
   Serial.begin(115200);
@@ -234,7 +235,7 @@ void setup(void) {
     }
   }
   // Create FreeRTOS task (run on Core 1 - recommended)
-  xTaskCreatePinnedToCore(serialTask, "SerialTask", 14000, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(serialTask, "SerialTask", 14000, NULL, 1, NULL, 0);
 
 
   for (int attempt = 0; attempt < 3 && !powerFailDetected; attempt++) {
@@ -314,8 +315,40 @@ void setup(void) {
     Serial.printf(F("mDNS begin failed!\n"));
   }
 }
-
 void loop(void) {
+  if (webServerStarted) {
+    server.handleClient();  // This is mandatory!
+  }
+  webSocket.loop();  // Important for WebSocketsServer
+  if (powerFailDetected && state.wifiConnected && isApiReachable() && !httpState.active) {
+    unsigned long downtime = (millis() - state.powerfailTimestamp + endPointPowerupTime) / 1000;
+    sendWebRequest("0", MACHINE_ID, 19, 0, downtime);
+    powerFailDetected = false;
+  }
+  static unsigned long lastLog = 0;
+  if (millis() - lastLog >= 60000) {
+    if (WiFi.status() != WL_CONNECTED || !isApiReachable()) {
+      Serial.printf(F("Stale WiFi detected (API unreachable)! RSSI: %d dBm, IP: %s. Forcing reconnect...\n"), WiFi.RSSI(), WiFi.localIP().toString().c_str());
+      setupWiFi();
+    }
+    fetchMachineData();
+
+    uint32_t totalHeap = ESP.getHeapSize();
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t minFreeHeap = ESP.getMinFreeHeap();
+    uint32_t usedHeap = totalHeap - freeHeap;
+
+    float heapUsedPercent = (float)usedHeap / totalHeap * 100.0f;
+    float heapFreePercent = (float)freeHeap / totalHeap * 100.0f;
+    float minFreePercent = totalHeap > 0 ? (float)minFreeHeap / totalHeap * 100.0f : 0.0f;
+
+    Serial.printf(F("-Heap → Total: %u  Used: %u  Free: %u  MinEver: %u bytes\n"), totalHeap, usedHeap, freeHeap, minFreeHeap);
+    Serial.printf(F("-     →            Used: %.1f%%   Free: %.1f%%   MinEver: %.1f%%\n"), heapUsedPercent, heapFreePercent, minFreePercent);
+
+    lastLog = millis();
+  }
+  scheduleRestart();                   // your existing function
+  vTaskDelay(1 / portTICK_PERIOD_MS);  // yield a bit
 }
 void serialTask(void* parameter) {
   for (;;) {
@@ -576,7 +609,7 @@ void sendScreenCommand() {
 
 //========== Handle server and coude data exchange =========
 void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions) {
-  if (!state.wifiConnected || WiFi.status() != WL_CONNECTED) {
+  if (!state.wifiConnected || !isApiReachable()) {
     Serial.println(F("WiFi not connected → queuing request"));
     queueWebRequest(operatorID, machineID, haltCode, position, revolutions);
     return;
@@ -622,7 +655,7 @@ void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int
   handleWebRequest();
 }
 void fetchMachineData() {
-  if (!state.wifiConnected || WiFi.status() != WL_CONNECTED) {
+  if (!state.wifiConnected || !isApiReachable()) {
     Serial.println(F("WiFi not connected → skipping fetch"));
     return;
   }
@@ -803,6 +836,7 @@ void setupWiFi() {
     state.wifiConnected = true;
     digitalWrite(39, HIGH);
     UpdateScreen('X', 1);
+    resetMDNS();
     handleWebServer();
     fetchMachineData();
   } else {
@@ -1164,42 +1198,41 @@ void i2cScanner() {
   }
   Serial.println("Scan finished.\n");
 }
+bool isApiReachable() {
+  WiFiClient client;
+  // Parse host/port (your code already has this)
+  String url = API_BASE_URL;
+  url.toLowerCase();
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd == -1) return false;
+  String hostPart = url.substring(schemeEnd + 3);
+  int pathStart = hostPart.indexOf('/');
+  if (pathStart != -1) hostPart = hostPart.substring(0, pathStart);
+  int portStart = hostPart.indexOf(':');
+  String host = (portStart != -1) ? hostPart.substring(0, portStart) : hostPart;
+  int port = (portStart != -1) ? hostPart.substring(portStart + 1).toInt() : 80;  // HTTP, not HTTPS
 
-// bool isApiReachable() {
-//   WiFiClient client;
-//   // Parse host/port (your code already has this)
-//   String url = API_BASE_URL;
-//   url.toLowerCase();
-//   int schemeEnd = url.indexOf("://");
-//   if (schemeEnd == -1) return false;
-//   String hostPart = url.substring(schemeEnd + 3);
-//   int pathStart = hostPart.indexOf('/');
-//   if (pathStart != -1) hostPart = hostPart.substring(0, pathStart);
-//   int portStart = hostPart.indexOf(':');
-//   String host = (portStart != -1) ? hostPart.substring(0, portStart) : hostPart;
-//   int port = (portStart != -1) ? hostPart.substring(portStart + 1).toInt() : 80;  // HTTP, not HTTPS
+  client.setTimeout(3000);  // 3s timeout
+  // Serial.printf(F(" Testing reachability: %s:%d\n"), host.c_str(), port);
+  if (client.connect(host.c_str(), port)) {
+    client.stop();
+    Serial.printf(F(" Server reachable\n"));
+    return true;
+  }
+  IPAddress gw = WiFi.gatewayIP();
+  if (gw == IPAddress(0, 0, 0, 0) || WiFi.localIP() == IPAddress(0, 0, 0, 0) || WiFi.RSSI() == 0) {
+    Serial.printf(F(" Invalid WiFi state (gw/IP/RSSI=0) → network issue\n"));
+    return false;
+  }
 
-//   client.setTimeout(3000);  // 3s timeout
-//   // Serial.printf(F(" Testing reachability: %s:%d\n"), host.c_str(), port);
-//   if (client.connect(host.c_str(), port)) {
-//     client.stop();
-//     Serial.printf(F(" Server reachable\n"));
-//     return true;
-//   }
-//   IPAddress gw = WiFi.gatewayIP();
-//   if (gw == IPAddress(0, 0, 0, 0) || WiFi.localIP() == IPAddress(0, 0, 0, 0) || WiFi.RSSI() == 0) {
-//     Serial.printf(F(" Invalid WiFi state (gw/IP/RSSI=0) → network issue\n"));
-//     return false;
-//   }
-
-//   client.setTimeout(2000);
-//   Serial.printf(F(" Testing gateway: %s:80\n"), gw.toString().c_str());
-//   if (client.connect(gw, 80)) {  // Or port 53 if your router uses DNS
-//     client.stop();
-//     Serial.printf(F(" Gateway reachable → server likely down (no WiFi reconnect needed)\n"));
-//     return true;  // Treat as "reachable" for WiFi purposes
-//   } else {
-//     Serial.printf(F(" Gateway unreachable → WiFi/network issue\n"));
-//     return false;
-//   }
-// }
+  client.setTimeout(2000);
+  Serial.printf(F(" Testing gateway: %s:80\n"), gw.toString().c_str());
+  if (client.connect(gw, 80)) {  // Or port 53 if your router uses DNS
+    client.stop();
+    Serial.printf(F(" Gateway reachable → server likely down (no WiFi reconnect needed)\n"));
+    return true;  // Treat as "reachable" for WiFi purposes
+  } else {
+    Serial.printf(F(" Gateway unreachable → WiFi/network issue\n"));
+    return false;
+  }
+}
