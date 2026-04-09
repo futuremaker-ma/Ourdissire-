@@ -321,7 +321,7 @@ void action_submit_avencement(lv_event_t *e) {
 
   // NOW safely change the page (this will trigger clean only on next tick)
   displayIndex = OPERATORID_PAGE;
-  isSettingStage = false;
+  isSettingStage = true;
 }
 
 void action_cancel_avencement(lv_event_t *e) {
