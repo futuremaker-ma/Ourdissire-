@@ -7,20 +7,20 @@
 extern "C" {
 #endif
 
-// Screens
+  // Screens
 
-enum ScreensEnum {
+  enum ScreensEnum {
     _SCREEN_ID_FIRST = 1,
     SCREEN_ID_MAIN = 1,
     _SCREEN_ID_LAST = 1
-};
-  
-typedef struct _objects_t {
+  };
+
+  typedef struct _objects_t {
     // Screen & main containers
     lv_obj_t *main;
     lv_obj_t *header_panel;
-    lv_obj_t *content_panel;           // ← the single reusable content panel
-    lv_obj_t *halt_report_panel;       // overlay, never deleted
+    lv_obj_t *content_panel;      // ← the single reusable content panel
+    lv_obj_t *halt_report_panel;  // overlay, never deleted
 
     // Header elements
     lv_obj_t *return_button;
@@ -90,19 +90,33 @@ typedef struct _objects_t {
     lv_obj_t *resume_production;
     lv_obj_t *halt_report_overlay;
 
-} objects_t;
+    // avencement panel
+    lv_obj_t *avencement_panel;
+    lv_obj_t *avencement_textarea;
+    lv_obj_t *submet_avencement;
+    lv_obj_t *cancel_avencement;
 
-extern objects_t objects;
+    // Encantrage pop up
+    lv_obj_t *encantrage_panel;
+    lv_obj_t *encantrage_button;
+    lv_obj_t *encantrage_partiel_button;
+    lv_obj_t *fin_encantrage_button;
+    lv_obj_t *cancel_encantrage_setting;
 
-void SendData();
+  } objects_t;
 
-void create_screen_main();
-void tick_screen_main();
+  extern objects_t objects;
 
-void tick_screen_by_id(enum ScreensEnum screenId);
-void tick_screen(int screen_index);
 
-void create_screens();
+  void SendData();
+
+  void create_screen_main();
+  void tick_screen_main();
+
+  void tick_screen_by_id(enum ScreensEnum screenId);
+  void tick_screen(int screen_index);
+
+  void create_screens();
 
 #ifdef __cplusplus
 }
