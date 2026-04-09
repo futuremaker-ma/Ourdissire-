@@ -74,7 +74,6 @@ int x, y, z;
 #define DRAW_BUF_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 20 * (LV_COLOR_DEPTH / 8))
 static lv_color_t* draw_buf = nullptr;
 
-
 // Get the Touchscreen data
 void touchscreen_read(lv_indev_t* indev, lv_indev_data_t* data) {
   // Checks if Touchscreen was touched, and prints X, Y and Pressure (Z)
@@ -237,13 +236,13 @@ void SendData() {
     Serial.print("cmd:Data");
   }
 
-  // Value (generic)
+  // Value
   if (strcmp(command, "Stage") == 0) {
     Serial.print(",value:");
     Serial.print(stageCode);
     if (stageCode == 109) {
       Serial.print(",Av:");
-      Serial.print(Avencement);
+      Serial.print(Avencement ? Avencement : "2.000");
     }
   } else if (strcmp(command, "Halt") == 0) {
     Serial.print(",value:");
@@ -256,19 +255,15 @@ void SendData() {
       Serial.print(",value:");
       Serial.print(URL);
     }
-  } else
+  }
 
-    // Operator ID (optional but consistent)
-    if (operatorID && operatorID[0] != '\0') {
-      Serial.print(",OpID:");
-      Serial.print(operatorID);
-    }
+  // Operator ID - only send if we have one
+  if (operatorID && operatorID[0] != '\0' && strcmp(operatorID, "0") != 0) {
+    Serial.print(",OpID:");
+    Serial.print(operatorID);
+  }
 
   Serial.println("<END>");
-
-  operatorID = "0";
-
-  printMemoryUsage();
 }
 void printMemoryUsage() {
   size_t totalHeap = ESP.getHeapSize();             // Total heap size
