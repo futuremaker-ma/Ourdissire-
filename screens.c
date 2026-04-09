@@ -57,41 +57,55 @@ static const struct {
 //
 // Event handlers
 //
-
 void action_send_command(lv_event_t *e) {
   lv_obj_t *target = lv_event_get_target(e);
   lv_event_code_t code = lv_event_get_code(e);
 
-  // Keyboard READY on Operator ID page
-  if (target == objects.keyboard && code == LV_EVENT_READY && displayIndex == OPERATORID_PAGE) {
-    if (isSettingStage) {
-      command = "Stage";
-      stageCode = temp_code;
-      currentStage = temp_stage;
-      stageDuration = 0;
-    } else {
-      command = "Halt";
-      stopCode = temp_code;
-      stopDuration = 0;
+  // === KEYBOARD READY or BUTTON OK on Operator ID page ===
+  if ((target == objects.keyboard && code == LV_EVENT_READY) || target == objects.button_ok) {
+    if (displayIndex == OPERATORID_PAGE) {
+      const char *operator_id = lv_textarea_get_text(objects.operator_id_text_area);
+
+      if (operator_id == NULL || operator_id[0] == '\0') {
+        return;
+      }
+
+      // Check if it's only spaces/tabs
+      bool is_empty = true;
+      for (int i = 0; operator_id[i] != '\0'; i++) {
+        if (operator_id[i] != ' ' && operator_id[i] != '\t') {
+          is_empty = false;
+          break;
+        }
+      }
+      if (is_empty) {
+        return;
+      }
+
+      // === SAFE COPY OF OPERATOR ID ===
+      static char operator_id_buffer[32];  // Persistent buffer
+      strncpy(operator_id_buffer, operator_id, sizeof(operator_id_buffer) - 1);
+      operator_id_buffer[sizeof(operator_id_buffer) - 1] = '\0';
+
+      operatorID = operator_id_buffer;  // Now safe
+
+      // Decide command type
+      if (isSettingStage) {
+        command = "Stage";
+        stageCode = temp_code;
+        currentStage = temp_stage;
+        stageDuration = 0;
+      } else {
+        command = "Halt";
+        stopCode = temp_code;
+        stopDuration = 0;
+      }
+
+      goto finish_operator_id;
     }
-    goto finish_operator_id;
-  }
-  // Button OK
-  if (target == objects.button_ok) {
-    if (isSettingStage) {
-      command = "Stage";
-      stageCode = temp_code;
-      currentStage = temp_stage;
-      stageDuration = 0;
-    } else {
-      command = "Halt";
-      stopCode = temp_code;
-      stopDuration = 0;
-    }
-    goto finish_operator_id;
   }
 
-  // Other actions (machine ID, URL, etc.)
+  // ==================== Other actions (Settings, etc.) ====================
   if (target == objects.set_new_machine_id) {
     command = "machID";
     Machine_ID = atoi(lv_textarea_get_text(objects.machine_id_text_area));
@@ -107,28 +121,37 @@ void action_send_command(lv_event_t *e) {
     command = "Portal";
   } else if (target == objects.reboot_system) {
     command = "Reboot";
+  } else {
+    return;
   }
 
   SendData();
   return;
 
 finish_operator_id:
-  operatorID = lv_textarea_get_text(objects.operator_id_text_area);
   lv_keyboard_set_textarea(objects.keyboard, NULL);
   lv_obj_add_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
+
   displayIndex = DEFAULT_PAGE;
-  isSettingStage = false;  // reset for next time
+  isSettingStage = false;
   temp_code = 0;
   temp_stage = 0;
 
   SendData();
 }
+
 void action_return_icon_button(lv_event_t *e) {
   if (displayIndex == SETTINGS_PAGE) {
     displayIndex = DEFAULT_PAGE;
   } else if (displayIndex == CATEGORIES_PAGE) {
     displayIndex = DEFAULT_PAGE;
   } else if (displayIndex == HALTCODES_PAGE) {
+    if (!lv_obj_has_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN)) {
+      lv_textarea_set_text(objects.avencement_textarea, "");
+      lv_obj_add_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (!lv_obj_has_flag(objects.encantrage_panel, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(objects.encantrage_panel, LV_OBJ_FLAG_HIDDEN);
+
     displayIndex = isSettingStage ? DEFAULT_PAGE : CATEGORIES_PAGE;
   } else if (displayIndex == OPERATORID_PAGE) {
     displayIndex = HALTCODES_PAGE;
@@ -168,7 +191,7 @@ void action_show_keyboard(lv_event_t *e) {
     lv_keyboard_set_textarea(kb, ta);
 
     // Set keyboard mode
-    if (ta == objects.machine_id_text_area || ta == objects.ip_textarea || ta == objects.port_textarea) {
+    if (ta == objects.machine_id_text_area || ta == objects.ip_textarea || ta == objects.port_textarea || objects.avencement_textarea) {
       lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
     } else if (ta == objects.db_textarea) {
       lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_USER_1);
@@ -262,6 +285,7 @@ void action_set_temp_code(lv_event_t *e) {
 
   if (currentCategory == STAGES) {
     isSettingStage = true;
+    if (!lv_obj_has_flag(objects.encantrage_panel, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(objects.encantrage_panel, LV_OBJ_FLAG_HIDDEN);
     switch (code) {
       case 103: temp_stage = ENCANTRAGE; break;
       case 106: temp_stage = ENCANTRAGE_PARTIEL; break;
@@ -271,7 +295,23 @@ void action_set_temp_code(lv_event_t *e) {
       case 109: temp_stage = OURDISSAGE; break;
       case 111: temp_stage = ENSOUPLAGE; break;
       case 112: temp_stage = FIN_ENSOUPLAGE; break;
-      default: temp_stage = 0; break;
+      default: temp_stage = 0; return;
+    }
+    if (code == 109) {
+      if (objects.avencement_panel) {
+        lv_obj_clear_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(objects.avencement_panel);  // bring to front
+
+        // Focus textarea + show numerical keyboard
+        if (objects.avencement_textarea) {
+          lv_obj_add_state(objects.avencement_textarea, LV_STATE_FOCUSED);
+          lv_keyboard_set_textarea(objects.keyboard, objects.avencement_textarea);
+          lv_keyboard_set_mode(objects.keyboard, LV_KEYBOARD_MODE_NUMBER);
+          lv_obj_clear_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
+          lv_obj_move_foreground(objects.keyboard);
+        }
+      }
+      return;
     }
   } else {
     isSettingStage = false;
@@ -280,7 +320,52 @@ void action_set_temp_code(lv_event_t *e) {
 
   displayIndex = OPERATORID_PAGE;
 }
+void action_submit_avencement(lv_event_t *e) {
+  if (objects.avencement_textarea == NULL) return;
 
+  const char *value = lv_textarea_get_text(objects.avencement_textarea);
+  if (value && value[0] != '\0') {
+    static char avencement_buf[16];
+    snprintf(avencement_buf, sizeof(avencement_buf), "%s", value);
+    Avencement = avencement_buf;
+  } else {
+    Avencement = "2.000";
+    return;
+  }
+  lv_textarea_set_text(objects.avencement_textarea, "");
+  // Hide panel + keyboard immediately (very important)
+  if (objects.avencement_panel) {
+    lv_obj_add_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN);
+  }
+  lv_keyboard_set_textarea(objects.keyboard, NULL);
+  lv_obj_add_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
+
+  // NOW safely change the page (this will trigger clean only on next tick)
+  displayIndex = OPERATORID_PAGE;
+  isSettingStage = true;
+}
+void action_cancel_avencement(lv_event_t *e) {
+  // Just hide the panel and go back to halt codes page
+  lv_textarea_set_text(objects.avencement_textarea, "");
+  if (objects.avencement_panel) lv_obj_add_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN);
+  if (objects.keyboard) {
+    lv_keyboard_set_textarea(objects.keyboard, NULL);
+    lv_obj_add_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
+  }
+  displayIndex = HALTCODES_PAGE;
+}
+void action_open_encantrage_popup(lv_event_t *e) {
+  if (objects.encantrage_panel) {
+    lv_obj_clear_flag(objects.encantrage_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(objects.encantrage_panel);
+  }
+}
+void action_cancel_encantrage(lv_event_t *e) {
+  if (objects.encantrage_panel) {
+    lv_obj_add_flag(objects.encantrage_panel, LV_OBJ_FLAG_HIDDEN);
+  }
+  displayIndex = HALTCODES_PAGE;  // go back to halt codes
+}
 //
 // helper functions
 //
@@ -390,6 +475,76 @@ static lv_obj_t *create_textarea(lv_obj_t *parent, int32_t x, int32_t y, int32_t
   lv_obj_set_style_text_align(ta, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
 
   return ta;
+}
+// Helper: Create Avencement Panel as overlay (on main screen, not content_panel)
+static lv_obj_t *create_avencement_panel(void) {
+  objects.avencement_panel = lv_obj_create(objects.main);
+
+  lv_obj_set_pos(objects.avencement_panel, 5, 60);  // moved down a bit
+  lv_obj_set_size(objects.avencement_panel, 310, 190);
+  lv_obj_add_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(objects.avencement_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_pad_top(objects.avencement_panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_left(objects.avencement_panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  // Style like your halt report panel
+  lv_obj_set_style_bg_color(objects.avencement_panel, lv_color_hex(0x1E2A44), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_border_width(objects.avencement_panel, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_border_color(objects.avencement_panel, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_radius(objects.avencement_panel, 12, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_shadow_width(objects.avencement_panel, 15, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  create_label_centered(objects.avencement_panel, 90, 8, "Avencement", &lv_font_montserrat_20);
+
+  objects.avencement_textarea = create_textarea(objects.avencement_panel, 5, 45, 295, 55, "Inserer avencement", "0123456789.", 8, action_show_keyboard);
+  lv_obj_add_event_cb(objects.avencement_panel, action_show_keyboard, LV_EVENT_FOCUSED, NULL);
+  lv_obj_set_style_text_font(objects.avencement_textarea, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  objects.submet_avencement = create_button_with_font(objects.avencement_panel, 5, 115, 145, 48, "Remettre", &lv_font_montserrat_20, action_submit_avencement, NULL);
+  lv_obj_set_style_bg_color(objects.submet_avencement, lv_color_hex(0x00CC00), LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  objects.cancel_avencement = create_button_with_font(objects.avencement_panel, 153, 115, 145, 48, "Annuler", &lv_font_montserrat_20, action_cancel_avencement, NULL);
+  lv_obj_set_style_bg_color(objects.cancel_avencement, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  return objects.avencement_panel;
+}
+// Helper: Create Encantrage selection popup using your existing helpers
+static lv_obj_t *create_encantrage_panel(void) {
+  // Create the main panel (similar to avencement_panel)
+  objects.encantrage_panel = lv_obj_create(content_panel);
+
+  lv_obj_set_pos(objects.encantrage_panel, 0, 50);
+  lv_obj_set_size(objects.encantrage_panel, 308, 326);
+  lv_obj_add_flag(objects.encantrage_panel, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_remove_flag(objects.encantrage_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Apply styling similar to avencement_panel
+  lv_obj_set_style_bg_color(objects.encantrage_panel, lv_color_hex(0x1E2A44), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_border_width(objects.encantrage_panel, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_border_color(objects.encantrage_panel, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_radius(objects.encantrage_panel, 12, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_shadow_width(objects.encantrage_panel, 15, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_top(objects.encantrage_panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_left(objects.encantrage_panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  lv_obj_t *parent = objects.encantrage_panel;
+
+  // Title
+  create_label_centered(parent, 77, 8, "ENCANTRAGE", &lv_font_montserrat_20);
+  // ENCANTRAGE (103)
+  objects.encantrage_button = create_button_with_font(parent, 3, 50, 290, 50, "ENCANTRAGE (103)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)103);
+  style_halt_button(objects.encantrage_button, 103);
+  // ENCANTRAGE PARTIEL (106)
+  objects.encantrage_partiel_button = create_button_with_font(parent, 3, 105, 290, 50, "ENCANTRAGE PARTIEL (106)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)106);
+  style_halt_button(objects.encantrage_partiel_button, 106);
+  // FIN ENCANTRAGE (104)
+  objects.fin_encantrage_button = create_button_with_font(parent, 3, 160, 290, 50, "FIN ENCANTRAGE (104)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)104);
+  style_halt_button(objects.fin_encantrage_button, 104);
+  // Cancel button (red like in your example)
+  objects.cancel_encantrage_setting = create_button_with_font(parent, 76, 265, 145, 48, "Annuler", &lv_font_montserrat_18, action_cancel_encantrage, NULL);
+  lv_obj_set_style_bg_color(objects.cancel_encantrage_setting, lv_color_hex(0xffcc0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  return objects.encantrage_panel;
 }
 
 //
@@ -522,55 +677,54 @@ void populate_HaltCodesPanel(lv_obj_t *parent) {
 
   int y = 50;
   if (currentCategory == STAGES) {
-    lv_obj_t *btn1 = create_button_with_font(parent, 5, y, 300, 40, "Encantrage (103)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)103);
-    style_halt_button(btn1, 103);
-    y += 45;
-    lv_obj_t *btn2 = create_button_with_font(parent, 5, y, 300, 40, "Encantrage Partiel (106)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)106);
-    style_halt_button(btn2, 106);
-    y += 45;
-    lv_obj_t *btn3 = create_button_with_font(parent, 5, y, 300, 40, "Fin Encantrage (104)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)104);
-    style_halt_button(btn3, 104);
-    y += 45;
-    lv_obj_t *btn4 = create_button_with_font(parent, 5, y, 300, 40, "Nouage et Passage (105)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)105);
+    lv_obj_t *btn1 = create_button_with_font(parent, 5, y, 300, 50, "Encantrage", &lv_font_montserrat_18, action_open_encantrage_popup, NULL);
+    if (stageCode == 103 || stageCode == 104 || stageCode == 106) {
+      lv_obj_set_style_bg_color(btn1, lv_color_hex(0xCC11CC), LV_PART_MAIN | LV_STATE_DEFAULT);
+      lv_obj_set_style_text_color(btn1, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+    y += 55;
+    lv_obj_t *btn4 = create_button_with_font(parent, 5, y, 300, 50, "Nouage et Passage (105)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)105);
     style_halt_button(btn4, 105);
-    y += 45;
-    lv_obj_t *btn5 = create_button_with_font(parent, 5, y, 300, 40, "Piquage (107)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)107);
+    y += 55;
+    lv_obj_t *btn5 = create_button_with_font(parent, 5, y, 300, 50, "Piquage (107)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)107);
     style_halt_button(btn5, 107);
-    y += 45;
-    lv_obj_t *btn6 = create_button_with_font(parent, 5, y, 300, 40, "Ourdissage (109)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)109);
+    y += 55;
+    lv_obj_t *btn6 = create_button_with_font(parent, 5, y, 300, 50, "Ourdissage (109)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)109);
     style_halt_button(btn6, 109);
-    y += 45;
-    lv_obj_t *btn7 = create_button_with_font(parent, 5, y, 300, 40, "Ensouplage (111)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)111);
+    y += 55;
+    lv_obj_t *btn7 = create_button_with_font(parent, 5, y, 300, 50, "Ensouplage (111)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)111);
     style_halt_button(btn7, 111);
-    y += 45;
-    lv_obj_t *btn8 = create_button_with_font(parent, 5, y, 300, 40, "Fin Ensouplage (112)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)112);
+    y += 55;
+    lv_obj_t *btn8 = create_button_with_font(parent, 5, y, 300, 50, "Fin Ensouplage (112)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)112);
     style_halt_button(btn8, 112);
+
+    create_encantrage_panel();
   } else if (currentCategory == MECHANICAL) {
-    lv_obj_t *btn1 = create_button_with_font(parent, 5, y, 300, 40, "Attente Mecanique (121)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)121);
+    lv_obj_t *btn1 = create_button_with_font(parent, 5, y, 300, 50, "Attente Mecanique (121)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)121);
     style_halt_button(btn1, 121);
-    y += 45;
-    lv_obj_t *btn2 = create_button_with_font(parent, 5, y, 300, 40, "Reparation Mecanique (146)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)146);
+    y += 55;
+    lv_obj_t *btn2 = create_button_with_font(parent, 5, y, 300, 50, "Reparation Mecanique (146)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)146);
     style_halt_button(btn2, 146);
-    y += 45;
-    lv_obj_t *btn3 = create_button_with_font(parent, 5, y, 300, 40, "Fin Reparation Mecanique (122)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)122);
+    y += 55;
+    lv_obj_t *btn3 = create_button_with_font(parent, 5, y, 300, 50, "Fin Reparation Mecanique (122)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)122);
     style_halt_button(btn3, 122);
   } else if (currentCategory == ELECTRICAL) {
-    lv_obj_t *btn1 = create_button_with_font(parent, 5, y, 300, 40, "Attente Electrique (123)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)123);
+    lv_obj_t *btn1 = create_button_with_font(parent, 5, y, 300, 50, "Attente Electrique (123)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)123);
     style_halt_button(btn1, 123);
-    y += 45;
-    lv_obj_t *btn2 = create_button_with_font(parent, 5, y, 300, 40, "Reparation Electrique (147)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)147);
+    y += 55;
+    lv_obj_t *btn2 = create_button_with_font(parent, 5, y, 300, 50, "Reparation Electrique (147)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)147);
     style_halt_button(btn2, 147);
-    y += 45;
-    lv_obj_t *btn3 = create_button_with_font(parent, 5, y, 300, 40, "Fin Reparation Electrique (124)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)124);
+    y += 55;
+    lv_obj_t *btn3 = create_button_with_font(parent, 5, y, 300, 50, "Fin Reparation Electrique (124)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)124);
     style_halt_button(btn3, 124);
   } else if (currentCategory == OPERATOR) {
-    lv_obj_t *btn1 = create_button_with_font(parent, 5, y, 300, 40, "Debut de Pause (113)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)113);
+    lv_obj_t *btn1 = create_button_with_font(parent, 5, y, 300, 50, "Debut de Pause (113)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)113);
     style_halt_button(btn1, 113);
-    y += 45;
-    lv_obj_t *btn2 = create_button_with_font(parent, 5, y, 300, 40, "Fin de Pause (114)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)114);
+    y += 55;
+    lv_obj_t *btn2 = create_button_with_font(parent, 5, y, 300, 50, "Fin de Pause (114)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)114);
     style_halt_button(btn2, 114);
-    y += 45;
-    lv_obj_t *btn3 = create_button_with_font(parent, 5, y, 300, 40, "Reparation Operateur (115)", &lv_font_montserrat_16, action_set_temp_code, (void *)(intptr_t)115);
+    y += 55;
+    lv_obj_t *btn3 = create_button_with_font(parent, 5, y, 300, 50, "Reparation Operateur (115)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)115);
     style_halt_button(btn3, 115);
   }
 }
@@ -783,8 +937,10 @@ void create_screen_main(void) {
     objects.resume_production = create_button_with_font(objects.halt_report_panel, 8, 265, 290, 38, "Poursuivre Production", &lv_font_montserrat_22, action_display, NULL);
     lv_obj_set_style_bg_color(objects.resume_production, lv_color_hex(0x00FF00), LV_PART_MAIN | LV_STATE_DEFAULT);
   }
+
   // Start on default page
   populate_DefaultPanel(content_panel);
+  create_avencement_panel();
 }
 void tick_screen_main() {
   static char buf[32];
@@ -1119,7 +1275,6 @@ void tick_screen_by_id(enum ScreensEnum screenId) {
 //
 // Fonts
 //
-
 ext_font_desc_t fonts[] = {
 #if LV_FONT_MONTSERRAT_8
   { "MONTSERRAT_8", &lv_font_montserrat_8 },
