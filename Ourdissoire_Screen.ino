@@ -62,36 +62,42 @@ void action_send_command(lv_event_t *e) {
   lv_obj_t *target = lv_event_get_target(e);
   lv_event_code_t code = lv_event_get_code(e);
 
-  // Keyboard READY on Operator ID page
-  if (target == objects.keyboard && code == LV_EVENT_READY && displayIndex == OPERATORID_PAGE) {
-    if (isSettingStage) {
-      command = "Stage";
-      stageCode = temp_code;
-      currentStage = temp_stage;
-      stageDuration = 0;
-    } else {
-      command = "Halt";
-      stopCode = temp_code;
-      stopDuration = 0;
+  // === KEYBOARD READY or BUTTON OK on Operator ID page ===
+  if ((target == objects.keyboard && code == LV_EVENT_READY) || target == objects.button_ok) {
+    if (displayIndex == OPERATORID_PAGE) {
+      const char *operator_id = lv_textarea_get_text(objects.operator_id_text_area);
+      if (operator_id == NULL || operator_id[0] == '\0') {
+        return;
+      }
+      bool is_empty = true;
+      for (int i = 0; operator_id[i] != '\0'; i++) {
+        if (operator_id[i] != ' ' && operator_id[i] != '\t') {
+          is_empty = false;
+          break;
+        }
+      }
+      if (is_empty) {
+        return;
+      }
+      // ====================================================
+
+      // If we reach here → ID is valid
+      if (isSettingStage) {
+        command = "Stage";
+        stageCode = temp_code;
+        currentStage = temp_stage;
+        stageDuration = 0;
+      } else {
+        command = "Halt";
+        stopCode = temp_code;
+        stopDuration = 0;
+      }
+
+      goto finish_operator_id;
     }
-    goto finish_operator_id;
-  }
-  // Button OK
-  if (target == objects.button_ok) {
-    if (isSettingStage) {
-      command = "Stage";
-      stageCode = temp_code;
-      currentStage = temp_stage;
-      stageDuration = 0;
-    } else {
-      command = "Halt";
-      stopCode = temp_code;
-      stopDuration = 0;
-    }
-    goto finish_operator_id;
   }
 
-  // Other actions (machine ID, URL, etc.)
+  // ==================== Other actions (unchanged) ====================
   if (target == objects.set_new_machine_id) {
     command = "machID";
     Machine_ID = atoi(lv_textarea_get_text(objects.machine_id_text_area));
@@ -107,6 +113,9 @@ void action_send_command(lv_event_t *e) {
     command = "Portal";
   } else if (target == objects.reboot_system) {
     command = "Reboot";
+  } else {
+    // SendData();
+    return;
   }
 
   SendData();
@@ -117,18 +126,23 @@ finish_operator_id:
   lv_keyboard_set_textarea(objects.keyboard, NULL);
   lv_obj_add_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
   displayIndex = DEFAULT_PAGE;
-  isSettingStage = false;  // reset for next time
+  isSettingStage = false;
   temp_code = 0;
   temp_stage = 0;
 
   SendData();
 }
+
 void action_return_icon_button(lv_event_t *e) {
   if (displayIndex == SETTINGS_PAGE) {
     displayIndex = DEFAULT_PAGE;
   } else if (displayIndex == CATEGORIES_PAGE) {
     displayIndex = DEFAULT_PAGE;
   } else if (displayIndex == HALTCODES_PAGE) {
+    if (!lv_obj_has_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN)) {
+      lv_textarea_set_text(objects.avencement_textarea, "");
+      lv_obj_add_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN);
+    }
     displayIndex = isSettingStage ? DEFAULT_PAGE : CATEGORIES_PAGE;
   } else if (displayIndex == OPERATORID_PAGE) {
     displayIndex = HALTCODES_PAGE;
@@ -296,7 +310,6 @@ void action_set_temp_code(lv_event_t *e) {
 
   displayIndex = OPERATORID_PAGE;
 }
-
 void action_submit_avencement(lv_event_t *e) {
   if (objects.avencement_textarea == NULL) return;
 
@@ -309,7 +322,7 @@ void action_submit_avencement(lv_event_t *e) {
     Avencement = "2.000";
     return;
   }
-  printf("Avencement: %s\n", Avencement);
+  lv_textarea_set_text(objects.avencement_textarea, "");
   // Hide panel + keyboard immediately (very important)
   if (objects.avencement_panel) {
     lv_obj_add_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN);
@@ -317,15 +330,13 @@ void action_submit_avencement(lv_event_t *e) {
   lv_keyboard_set_textarea(objects.keyboard, NULL);
   lv_obj_add_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
 
-  lv_textarea_set_text(objects.avencement_textarea, "");
-
   // NOW safely change the page (this will trigger clean only on next tick)
   displayIndex = OPERATORID_PAGE;
   isSettingStage = true;
 }
-
 void action_cancel_avencement(lv_event_t *e) {
   // Just hide the panel and go back to halt codes page
+  lv_textarea_set_text(objects.avencement_textarea, "");
   if (objects.avencement_panel) lv_obj_add_flag(objects.avencement_panel, LV_OBJ_FLAG_HIDDEN);
   if (objects.keyboard) {
     lv_keyboard_set_textarea(objects.keyboard, NULL);
@@ -476,6 +487,7 @@ static lv_obj_t *create_avencement_panel(void) {
 
   return objects.avencement_panel;
 }
+
 
 //
 // Screens
