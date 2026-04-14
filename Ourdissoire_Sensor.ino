@@ -7,7 +7,11 @@ NeoSWSerial mySerial(11, 12);
 
 char mySerialBuffer[16];
 uint8_t mySerialIndex = 0;
-int16_t STOP_TIMEOUT_MS = 4000;
+int16_t STOP_TIMEOUT_MS = 3000;
+
+/*
+L = N*PI(D + N*Tg*Av/1000)
+*/
 
 // ================== CONSTANTS ==================
 const unsigned long SPEED_INTERVAL_MS = 1000;
@@ -16,8 +20,14 @@ const unsigned long STATUS_INTERVAL_MS = 500;
 const uint8_t MIN_PULSES_TO_RESUME = 2;
 
 const float INITIAL_CIRCUMFERENCE = 3.125f;
-const float DIAMETER_INCREASE_PER_50_REVS = 0.02f;
+const float DIAMETER_INCREASE_PER_50_REVS = 0.033f;
 const float CIRC_INCREASE_PER_REV = (3.1415926535f * DIAMETER_INCREASE_PER_50_REVS) / 50.0f;
+//============= New formula ==================
+const float INITIAL_DIAMETER = 0.9947f;
+const float TANGENT = 0.1756f;
+const float Avancement = 2.000f;
+
+//===========================================
 
 // ===== MECHANICS =====
 const float DRUM_CIRCUMFERENCE_M = 3.15;
@@ -44,9 +54,10 @@ bool mainprogramready = false;
 float minuteLength = 0;
 float linearSpeed = 0;
 
-
 enum ProductionStages {
   ENCOUTRAGE,
+  ENCOUTRAGE_PARTIEL,
+  FIN_ENCOUTRAGE,
   NOUAGE,
   PIQUAGE,
   OURDISSAGE,
@@ -54,7 +65,7 @@ enum ProductionStages {
   REPARATION
 };
 
-ProductionStages prodStage = NOUAGE;
+ProductionStages prodStage = ENCOUTRAGE;
 // ================== SETUP ==================
 void setup() {
 
@@ -86,19 +97,23 @@ void loop() {
       mySerialBuffer[mySerialIndex++] = c;
     }
   }
-  if (machineRunning && stopTime >= STOP_TIMEOUT_MS && prodStage != REPARATION) {
+  if (machineRunning && stopTime >= STOP_TIMEOUT_MS) {
 
     // Protection: if we had a pulse very recently → don't stop (glitch/timer lag)
-    if ((millis() - lastPulseTime) < 300) {  // had pulse in last 300 ms → ignore
+    if ((millis() - lastPulseTime) < 500) {  // had pulse in last 500 ms → ignore
       stopTime = 500;                        // reset partially to give breathing room
       Serial.println("Stop ignored - recent pulse detected");
     } else {
       // real stop
       if (!digitalRead(PIN_CHAIN_STOP)) {
-        mySerial.println("H102");
+        if (prodStage == OURDISSAGE) {
+          mySerial.println("H102");
+        }
         Serial.println("CASSE FIL");
       } else {
-        mySerial.println("H101");
+        if (prodStage == OURDISSAGE) {
+          mySerial.println("H101");
+        }
         Serial.println("NORMAL STOP");
       }
 
@@ -108,7 +123,8 @@ void loop() {
       // Optional: force zero speed on stop
       if (lastLinearSpeed != 0.0f) {
         mySerial.println("S0.00");
-        Serial.println("STOP → S0.00 m/s");
+        mySerial.println("A0.00");
+        Serial.println("STOP → S0.00 m/s, A0.00 RPM");
         lastLinearSpeed = 0.0f;
         linearSpeed = 0.0f;
         zeroSpeedSent = true;
@@ -119,7 +135,9 @@ void loop() {
   if (!machineRunning) {
     if (recentPulses >= MIN_PULSES_TO_RESUME) {  // just need enough recent pulses
       machineRunning = true;
-      mySerial.println("H100");
+      if (prodStage == OURDISSAGE) {
+        mySerial.println("H100");
+      }
       Serial.println("RUNNING");
       recentPulses = 0;        // reset counter
       zeroSpeedSent = false;   // also allow speed updates again
@@ -194,6 +212,8 @@ void processMySerialCommand(char* cmd) {
     case 'P':
       switch (value) {
         case 103: prodStage = ENCOUTRAGE; break;
+        case 104: prodStage = FIN_ENCOUTRAGE; break;
+        case 106: prodStage = ENCOUTRAGE_PARTIEL; break;
         case 105: prodStage = NOUAGE; break;
         case 107: prodStage = PIQUAGE; break;
         case 109: prodStage = OURDISSAGE; break;
@@ -210,7 +230,7 @@ void processMySerialCommand(char* cmd) {
   if (prodStage == ENSOUPLAGE) {
     STOP_TIMEOUT_MS = 6000;
   } else {
-    STOP_TIMEOUT_MS = 4000;
+    STOP_TIMEOUT_MS = 3000;
   }
 }
 // ================== INTERRUPTS ==================
@@ -223,10 +243,12 @@ void isrPulse() {
   speedPulses++;  // Optional: Keep if you still want pulse counting elsewhere
   noInterrupts();
   drumRevolutions++;
-  float lengthThisRev = max(INITIAL_CIRCUMFERENCE, INITIAL_CIRCUMFERENCE + CIRC_INCREASE_PER_REV * (drumRevolutions - 1));
+  uint32_t N = drumRevolutions;
+  float Ln = N * 3.1415f * (INITIAL_DIAMETER + (N * TANGENT * Avancement / 1000.0f));
+  float Lprev = (N - 1) * 3.1415f * (INITIAL_DIAMETER + ((N - 1) * TANGENT * Avancement / 1000.0f));
+  float lengthThisRev = Ln - Lprev;
   beamLength += lengthThisRev;
   minuteLength += lengthThisRev;
-  // beamLength = drumRevolutions * ((drumRevolutions * 0.02 / 50) + 3.1);
   interrupts();
 
   zeroSpeedSent = false;
@@ -238,13 +260,14 @@ void isrPulse() {
 
       // Send only if changed enough (and machine is running)
       if (machineRunning && abs(linearSpeed - lastLinearSpeed) >= SPEED_CHANGE_THRESHOLD) {
+        int linearInt = (int)(linearSpeed * 100 + 0.05f);
         mySerial.print("S");
-        mySerial.println(linearSpeed, 2);
+        mySerial.println(linearInt);
 
-        // Serial.print("LINEAR SPEED => S");
-        // Serial.print(linearSpeed, 2);
-        // Serial.println("m/s");
-
+        float angularSpeed = 60.0f * linearSpeed / DRUM_CIRCUMFERENCE_M;  // example
+        int angularInt = (int)(angularSpeed * 100 + 0.05f);
+        mySerial.print("A");
+        mySerial.println(angularInt);
         lastLinearSpeed = linearSpeed;
       }
     }
