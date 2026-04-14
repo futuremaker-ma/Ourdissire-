@@ -119,8 +119,6 @@ void action_send_command(lv_event_t *e) {
     URL = urlstr;
   } else if (target == objects.open_portal) {
     command = "Portal";
-  } else if (target == objects.reboot_system) {
-    command = "Reboot";
   } else {
     return;
   }
@@ -807,8 +805,6 @@ void populate_SettingsPanel(lv_obj_t *parent) {
 
   // ==================== Open Portal Button ====================
   objects.open_portal = create_button_with_font(parent, 8, 290, 290, 40, "Open WIFI Portal", &lv_font_montserrat_20, action_send_command, NULL);
-  objects.reboot_system = create_button_with_font(parent, 8, 340, 290, 40, "Reboot", &lv_font_montserrat_20, action_send_command, NULL);
-  lv_obj_set_style_bg_color(objects.reboot_system, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
 void create_screen_main(void) {
