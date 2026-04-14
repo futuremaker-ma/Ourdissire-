@@ -80,7 +80,6 @@ extern "C" {
     lv_obj_t *db_textarea;
     lv_obj_t *set_database_url;
     lv_obj_t *open_portal;
-    lv_obj_t *reboot_system;
 
     // Halt Report Panel
     lv_obj_t *halt_cause_label;
