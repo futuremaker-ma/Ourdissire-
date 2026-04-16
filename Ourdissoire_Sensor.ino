@@ -7,53 +7,44 @@ NeoSWSerial mySerial(11, 12);
 
 char mySerialBuffer[16];
 uint8_t mySerialIndex = 0;
+
+// ================== TIMING ==================
 int16_t STOP_TIMEOUT_MS = 3000;
-
-/*
-L = N*PI(D + N*Tg*Av/1000)
-*/
-
-// ================== CONSTANTS ==================
-const unsigned long SPEED_INTERVAL_MS = 1000;
 const unsigned long LENGTH_INTERVAL_MS = 60000;
 const unsigned long STATUS_INTERVAL_MS = 500;
 const uint8_t MIN_PULSES_TO_RESUME = 2;
 
-const float INITIAL_CIRCUMFERENCE = 3.125f;
-const float DIAMETER_INCREASE_PER_50_REVS = 0.033f;
-const float CIRC_INCREASE_PER_REV = (3.1415926535f * DIAMETER_INCREASE_PER_50_REVS) / 50.0f;
-//============= New formula ==================
+// ================== MACHINE CONSTANTS ==================
+float Avancement = 2.000f;
 const float INITIAL_DIAMETER = 0.9947f;
 const float TANGENT = 0.1756f;
-const float Avancement = 2.000f;
-
-//===========================================
-
-// ===== MECHANICS =====
-const float DRUM_CIRCUMFERENCE_M = 3.15;
+const float DRUM_CIRCUMFERENCE_M = 3.15f;
 const float SPEED_CHANGE_THRESHOLD = 0.5f;
 
 // ================== VARIABLES ==================
-volatile uint32_t speedPulses = 0;
 volatile uint32_t drumRevolutions = 0;
-volatile float beamLength = 0.0f;
-
-volatile uint16_t stopTime = 0;
-volatile uint16_t speedTimer = 0;
-volatile uint32_t lengthTimer = 0;
-volatile uint32_t statusTimer = 0;
-volatile uint8_t recentPulses = 0;
+volatile uint32_t pulseCount = 0;
 volatile unsigned long lastPulseTime = 0;
-volatile float lastLinearSpeed = 0.0f;
-volatile bool zeroSpeedSent = false;
+volatile uint8_t recentPulses = 0;
+
+uint32_t lastProcessedRevs = 0;
+float beamLength = 0.0f;
+float minuteLength = 0.0f;
+float linearSpeed = 0.0f;
+float lastLinearSpeed = 0.0f;
 
 bool machineRunning = true;
-bool sendData = false;
+bool zeroSpeedSent = false;
 bool mainprogramready = false;
-// batch length
-float minuteLength = 0;
-float linearSpeed = 0;
 
+unsigned long lastLengthTime = 0;
+unsigned long lastStatusTime = 0;
+
+float targetLength = 0.0f;
+uint32_t targetRevolutions = 0;
+int windSection = 1;
+
+// ================== STAGES ==================
 enum ProductionStages {
   ENCOUTRAGE,
   ENCOUTRAGE_PARTIEL,
@@ -66,9 +57,9 @@ enum ProductionStages {
 };
 
 ProductionStages prodStage = ENCOUTRAGE;
+
 // ================== SETUP ==================
 void setup() {
-
   Serial.begin(115200);
   mySerial.begin(38400);
 
@@ -76,130 +67,194 @@ void setup() {
   pinMode(PIN_CHAIN_STOP, INPUT_PULLUP);
 
   attachInterrupt(digitalPinToInterrupt(REVOLUTION_PIN), isrPulse, RISING);
-  setupTimers();
-
-  lastPulseTime = 0;
-  lastLinearSpeed = 0.0f;
-  linearSpeed = 0.0f;
-  zeroSpeedSent = false;
 
   Serial.println("System started");
 }
-// ================== MAIN LOOP ==================
+// ================== LOOP ==================
 void loop() {
-  if (mySerial.available()) {
+  handleSerial();
+  processRevolutions();
+  handleSpeed();
+  handleStopLogic();
+  handleLengthBatch();
+  handleStatus();
+}
+// ================== ISR ==================
+void isrPulse() {
+  pulseCount++;
+  drumRevolutions++;
+  recentPulses++;
+  lastPulseTime = millis();
+}
+// ================== PROCESS REVOLUTIONS ==================
+void processRevolutions() {
+  noInterrupts();
+  uint32_t currentRevs = drumRevolutions;
+  interrupts();
+
+  while (lastProcessedRevs < currentRevs) {
+    lastProcessedRevs++;
+
+    float N = lastProcessedRevs;
+    float diameter = INITIAL_DIAMETER + (2.0f * N * TANGENT * Avancement / 1000.0f);
+    float lengthThisRev = 3.14159265f * diameter;
+
+    beamLength += lengthThisRev;
+    minuteLength += lengthThisRev;
+  }
+}
+// ================== SPEED ==================
+void handleSpeed() {
+  static unsigned long prevPulseTime = 0;
+
+  noInterrupts();
+  unsigned long pulseTime = lastPulseTime;
+  interrupts();
+
+  if (pulseTime != 0 && pulseTime != prevPulseTime) {
+    float delta_t = (pulseTime - prevPulseTime) * 0.001f;
+
+    if (delta_t > 0) {
+      linearSpeed = DRUM_CIRCUMFERENCE_M / delta_t;
+
+      if (machineRunning && abs(linearSpeed - lastLinearSpeed) >= SPEED_CHANGE_THRESHOLD) {
+        int linearInt = (int)(linearSpeed * 100 + 0.5f);
+
+        mySerial.print("S");
+        mySerial.println(linearInt);
+
+        float angularSpeed = 60.0f * linearSpeed / DRUM_CIRCUMFERENCE_M;
+        int angularInt = (int)(angularSpeed * 100 + 0.5f);
+
+        mySerial.print("A");
+        mySerial.println(angularInt);
+
+        lastLinearSpeed = linearSpeed;
+        zeroSpeedSent = false;
+      }
+    }
+
+    prevPulseTime = pulseTime;
+  }
+}
+// ================== STOP LOGIC ==================
+void handleStopLogic() {
+  unsigned long now = millis();
+
+  if ((now - lastPulseTime) >= STOP_TIMEOUT_MS) {
+    if (machineRunning) {
+
+      if (!digitalRead(PIN_CHAIN_STOP)) {
+        if (prodStage == OURDISSAGE) {
+          mySerial.println("H102");
+          Serial.println("CASSE FIL");
+        }
+      } else {
+        // ===== SECTION COMPLETE =====
+        if (prodStage == OURDISSAGE && targetRevolutions > 0) {
+          // Optional validation (you can relax this if needed)
+          if (drumRevolutions >= targetRevolutions * 0.98f) {
+            windSection++;
+            mySerial.print("Y");
+            mySerial.println(windSection);
+            Serial.print("Section completed → ");
+            Serial.println(windSection);
+            beamLength = 0;
+            drumRevolutions = 0;
+            lastProcessedRevs = 0;
+          } else {
+            mySerial.println("H101");
+            Serial.println("NORMAL STOP");
+          }
+        }
+      }
+
+      machineRunning = false;
+      recentPulses = 0;
+    }
+
+    if (!zeroSpeedSent) {
+      mySerial.println("S0.00");
+      mySerial.println("A0.00");
+      zeroSpeedSent = true;
+      lastLinearSpeed = 0.0f;
+    }
+  }
+
+  // AUTO RESUME
+  if (!machineRunning && recentPulses >= MIN_PULSES_TO_RESUME) {
+    machineRunning = true;
+    recentPulses = 0;
+
+    if (prodStage == OURDISSAGE) {
+      mySerial.println("H100");
+      Serial.println("RUNNING");
+    }
+  }
+}
+// ================== LENGTH ==================
+void handleLengthBatch() {
+  unsigned long now = millis();
+
+  if (now - lastLengthTime >= LENGTH_INTERVAL_MS) {
+    mySerial.print("L");
+    mySerial.println(minuteLength, 2);
+
+    minuteLength = 0;
+    lastLengthTime = now;
+  }
+}
+// ================== STATUS ==================
+void handleStatus() {
+  unsigned long now = millis();
+
+  if (machineRunning && now - lastStatusTime >= STATUS_INTERVAL_MS) {
+    mySerial.print("R");
+    mySerial.println(drumRevolutions);
+
+    mySerial.print("M");
+    mySerial.println(beamLength, 1);
+
+    lastStatusTime = now;
+  }
+}
+// ================== SERIAL ==================
+void handleSerial() {
+  while (mySerial.available()) {
     char c = mySerial.read();
+
     if (c == '\n') {
       mySerialBuffer[mySerialIndex] = '\0';
-      processMySerialCommand(mySerialBuffer);
+      processCommand(mySerialBuffer);
       mySerialIndex = 0;
     } else if (mySerialIndex < sizeof(mySerialBuffer) - 1) {
       mySerialBuffer[mySerialIndex++] = c;
     }
   }
-  if (machineRunning && stopTime >= STOP_TIMEOUT_MS) {
-
-    // Protection: if we had a pulse very recently → don't stop (glitch/timer lag)
-    if ((millis() - lastPulseTime) < 500) {  // had pulse in last 500 ms → ignore
-      stopTime = 500;                        // reset partially to give breathing room
-      Serial.println("Stop ignored - recent pulse detected");
-    } else {
-      // real stop
-      if (!digitalRead(PIN_CHAIN_STOP)) {
-        if (prodStage == OURDISSAGE) {
-          mySerial.println("H102");
-        }
-        Serial.println("CASSE FIL");
-      } else {
-        if (prodStage == OURDISSAGE) {
-          mySerial.println("H101");
-        }
-        Serial.println("NORMAL STOP");
-      }
-
-      machineRunning = false;
-      recentPulses = 0;
-
-      // Optional: force zero speed on stop
-      if (lastLinearSpeed != 0.0f) {
-        mySerial.println("S0.00");
-        mySerial.println("A0.00");
-        Serial.println("STOP → S0.00 m/s, A0.00 RPM");
-        lastLinearSpeed = 0.0f;
-        linearSpeed = 0.0f;
-        zeroSpeedSent = true;
-      }
-    }
-  }
-  // ===== AUTO RESUME =====
-  if (!machineRunning) {
-    if (recentPulses >= MIN_PULSES_TO_RESUME) {  // just need enough recent pulses
-      machineRunning = true;
-      if (prodStage == OURDISSAGE) {
-        mySerial.println("H100");
-      }
-      Serial.println("RUNNING");
-      recentPulses = 0;        // reset counter
-      zeroSpeedSent = false;   // also allow speed updates again
-      lastLinearSpeed = 0.0f;  // force resend of new speed
-    }
-  }
-  // ===== LINEAR SPEED TIMEOUT ZERO =====
-  if ((millis() - lastPulseTime) >= STOP_TIMEOUT_MS) {
-    if (!zeroSpeedSent && lastLinearSpeed != 0.0f) {
-      mySerial.println("S0.00");
-      // Serial.println("LINEAR SPEED TIMEOUT → S0.00 m/s");
-
-      lastLinearSpeed = 0.0f;
-      linearSpeed = 0.0f;
-      zeroSpeedSent = true;
-    }
-  }
-  // ===== LENGTH EVERY MINUTE =====
-  if (lengthTimer >= LENGTH_INTERVAL_MS) {
-    sendLengthBatch();
-  }
-
-  if (machineRunning && statusTimer >= STATUS_INTERVAL_MS) {
-    noInterrupts();
-    uint32_t revs = drumRevolutions;
-    float blen = beamLength;
-    interrupts();
-
-    mySerial.print("R");
-    mySerial.println(revs);
-    mySerial.print("M");
-    mySerial.println(blen, 1);
-
-    // Serial.print("total revolutions =>R");
-    // Serial.println(drumRevolutions);
-    // Serial.print("beam length => M");
-    // Serial.println(beamLength, 1);
-
-    statusTimer = 0;
-  }
 }
-// ================== FUNCTIONS ==================
-void sendLengthBatch() {
-
-  mySerial.print("L");
-  mySerial.println(minuteLength, 2);
-
-  // Serial.print("LENGH FEED this MINUTE => L");
-  // Serial.println(minuteLength, 2);
-
-  minuteLength = 0;
-  lengthTimer = 0;
-}
-void processMySerialCommand(char* cmd) {
-  Serial.print("ESP32: ");
+// ================== COMMAND PROCESS ==================
+void processCommand(char* cmd) {
   Serial.println(cmd);
   char command = cmd[0];
   int value = atoi(cmd + 1);
+
   switch (command) {
     case 'R':
       beamLength = 0;
       drumRevolutions = 0;
+      lastProcessedRevs = 0;
+      windSection = 1;
+      break;
+    case 'A': Avancement = value / 1000.0f; break;
+    case 'L':
+      targetLength = value;  // in meters
+      targetRevolutions = computeTargetRevolutions(targetLength);
+
+      Serial.print("Target Length: ");
+      Serial.println(targetLength);
+
+      Serial.print("Target Revs: ");
+      Serial.println(targetRevolutions);
       break;
     case 'S':
       Serial.println("Received 'S' command, starting program");
@@ -208,7 +263,9 @@ void processMySerialCommand(char* cmd) {
         Serial.println("Sent 'F1' to ESP32-S3");
         mainprogramready = true;
       }
+      Serial.println("D1");
       break;
+
     case 'P':
       switch (value) {
         case 103: prodStage = ENCOUTRAGE; break;
@@ -216,7 +273,17 @@ void processMySerialCommand(char* cmd) {
         case 106: prodStage = ENCOUTRAGE_PARTIEL; break;
         case 105: prodStage = NOUAGE; break;
         case 107: prodStage = PIQUAGE; break;
-        case 109: prodStage = OURDISSAGE; break;
+        case 109:
+          prodStage = OURDISSAGE;
+          beamLength = 0;
+          drumRevolutions = 0;
+          lastProcessedRevs = 0;
+          minuteLength = 0;
+          windSection = 1;
+          mySerial.println("D1");
+          mySerial.print("Y");
+          mySerial.println(windSection);
+          break;
         case 111: prodStage = ENSOUPLAGE; break;
         case 115:
         case 146:
@@ -224,78 +291,29 @@ void processMySerialCommand(char* cmd) {
         default: break;
       }
       break;
+
     default:
-      Serial.println("Invalid data from esp32");
+      Serial.println("Invalid command");
   }
-  if (prodStage == ENSOUPLAGE) {
-    STOP_TIMEOUT_MS = 6000;
-  } else {
-    STOP_TIMEOUT_MS = 3000;
-  }
+
+  STOP_TIMEOUT_MS = (prodStage == ENSOUPLAGE) ? 6000 : 3000;
 }
-// ================== INTERRUPTS ==================
-void isrPulse() {
-  stopTime = 0;
-  if (recentPulses < 3) recentPulses++;
+uint32_t computeTargetRevolutions(float targetL) {
+  float L = 0.0f;
+  uint32_t N = 0;
 
-  unsigned long currentTime = millis();  // Get current time
+  while (L < targetL) {
+    N++;
 
-  speedPulses++;  // Optional: Keep if you still want pulse counting elsewhere
-  noInterrupts();
-  drumRevolutions++;
-  uint32_t N = drumRevolutions;
-  float Ln = N * 3.1415f * (INITIAL_DIAMETER + (N * TANGENT * Avancement / 1000.0f));
-  float Lprev = (N - 1) * 3.1415f * (INITIAL_DIAMETER + ((N - 1) * TANGENT * Avancement / 1000.0f));
-  float lengthThisRev = Ln - Lprev;
-  beamLength += lengthThisRev;
-  minuteLength += lengthThisRev;
-  interrupts();
+    // 👇 KEY FIX: 2.0f × because TANGENT is radial growth, not diameter growth
+    float diameter = INITIAL_DIAMETER + (2.0f * N * TANGENT * Avancement / 1000.0f);
+    float lengthThisRev = 3.14159265f * diameter;
 
-  zeroSpeedSent = false;
-  // Calculate speed only if we have a previous pulse
-  if (lastPulseTime != 0) {
-    float delta_t = (currentTime - lastPulseTime) / 1000.0f;  // Seconds between pulses
-    if (delta_t > 0) {                                        // Avoid divide-by-zero
-      linearSpeed = DRUM_CIRCUMFERENCE_M / delta_t;
+    L += lengthThisRev;
 
-      // Send only if changed enough (and machine is running)
-      if (machineRunning && abs(linearSpeed - lastLinearSpeed) >= SPEED_CHANGE_THRESHOLD) {
-        int linearInt = (int)(linearSpeed * 100 + 0.05f);
-        mySerial.print("S");
-        mySerial.println(linearInt);
-
-        float angularSpeed = 60.0f * linearSpeed / DRUM_CIRCUMFERENCE_M;  // example
-        int angularInt = (int)(angularSpeed * 100 + 0.05f);
-        mySerial.print("A");
-        mySerial.println(angularInt);
-        lastLinearSpeed = linearSpeed;
-      }
-    }
+    // Safety limit
+    if (N > 9000) break;
   }
 
-  lastPulseTime = currentTime;  // Update for next time
-}
-void setupTimers() {
-
-  noInterrupts();
-
-  // ---- Timer2 10ms tick ----
-  TCCR2A = 0;
-  TCCR2B = 0;
-  OCR2A = 155;
-  TCCR2A |= (1 << WGM21);
-  TCCR2B |= (1 << CS22) | (1 << CS21) | (1 << CS20);
-  TIMSK2 |= (1 << OCIE2A);
-
-  interrupts();
-}
-// ===== 10ms tick =====
-ISR(TIMER2_COMPA_vect) {
-
-  if (machineRunning) {
-    stopTime += 10;
-    speedTimer += 10;
-    lengthTimer += 10;
-    statusTimer += 10;
-  }
+  return N;
 }
