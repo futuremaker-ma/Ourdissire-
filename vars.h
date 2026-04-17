@@ -28,13 +28,13 @@ extern "C" {
     SETTINGS_PAGE
   } Page;
 
-  typedef enum{
+  typedef enum {
     IDLE,
     MECHANICAL,
     ELECTRICAL,
     OPERATOR,
     STAGES
-  }Category;
+  } Category;
 
   // Flow global variables
   enum FlowGlobalVariables {
@@ -43,6 +43,7 @@ extern "C" {
 
   // Native global variables
   extern int Machine_ID;
+  extern char *Drum_circemferance;
   extern char *productionStageLabel;
   extern char *stopLabel;
   extern bool isConnected;
@@ -65,6 +66,7 @@ extern "C" {
   extern char *command;
   extern uint8_t stopCode;
   extern uint8_t stageCode;
+  extern char *Avencement;
 
 #ifdef __cplusplus
 }
