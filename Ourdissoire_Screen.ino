@@ -40,6 +40,7 @@ char* command = "";
 uint8_t stopCode = 100;
 uint8_t stageCode = 103;
 char* Avencement = "2.000";
+char* Drum_circemferance = "3.125";
 
 // Touchscreen pins
 #define XPT2046_IRQ 36   // T_IRQ
@@ -250,6 +251,9 @@ void SendData() {
   } else if (strcmp(command, "machID") == 0) {
     Serial.print(",value:");
     Serial.print(Machine_ID);
+  } else if (strcmp(command, "Circ") == 0) {
+    Serial.print(",value:");
+    Serial.print(Drum_circemferance);
   } else if (strcmp(command, "URL") == 0) {
     if (URL && URL[0] != '\0') {
       Serial.print(",value:");
