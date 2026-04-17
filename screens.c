@@ -109,6 +109,10 @@ void action_send_command(lv_event_t *e) {
   if (target == objects.set_new_machine_id) {
     command = "machID";
     Machine_ID = atoi(lv_textarea_get_text(objects.machine_id_text_area));
+  } else if (target == objects.set_new_circemferance) {
+    command = "Circ";
+    Drum_circemferance = lv_textarea_get_text(objects.circemferance_text_area);
+
   } else if (target == objects.set_database_url) {
     command = "URL";
     static char urlstr[64];
@@ -189,7 +193,7 @@ void action_show_keyboard(lv_event_t *e) {
     lv_keyboard_set_textarea(kb, ta);
 
     // Set keyboard mode
-    if (ta == objects.machine_id_text_area || ta == objects.ip_textarea || ta == objects.port_textarea || objects.avencement_textarea) {
+    if (ta == objects.machine_id_text_area || ta == objects.ip_textarea || ta == objects.port_textarea || objects.avencement_textarea || objects.circemferance_text_area) {
       lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
     } else if (ta == objects.db_textarea) {
       lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_USER_1);
@@ -785,9 +789,27 @@ void populate_SettingsPanel(lv_obj_t *parent) {
   objects.set_new_machine_id = create_button(objects.set_machine_id, 230, -6, 55, 38, "Set", action_send_command, NULL);
   lv_obj_set_style_bg_color(objects.set_new_machine_id, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
 
+  // ==================== Drum circumferance ====================
+  objects.set_circemferance = create_label(parent, 3, 68, "Circemferance", &lv_font_montserrat_18);
+  lv_obj_set_size(objects.set_circemferance, 300, 48);
+  lv_obj_remove_flag(objects.set_circemferance, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_outline_width(objects.set_circemferance, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_outline_color(objects.set_circemferance, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_radius(objects.set_circemferance, 5, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_top(objects.set_circemferance, 12, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_bottom(objects.set_circemferance, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_left(objects.set_circemferance, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_right(objects.set_circemferance, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  objects.circemferance_text_area = create_textarea(objects.set_circemferance, 110, -9, 112, 38, "3.125", "0,1,2,3,4,5,6,7,8,9,.", 8, action_show_keyboard);
+  lv_obj_set_style_text_align(objects.circemferance_text_area, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_textarea_set_max_length(objects.circemferance_text_area, 8);
+
+  objects.set_new_circemferance = create_button(objects.set_circemferance, 230, -6, 55, 38, "Set", action_send_command, NULL);
+  lv_obj_set_style_bg_color(objects.set_new_circemferance, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
 
   // ==================== Database Section ====================
-  objects.set_database_link = create_content_panel(parent, 3, 70, 300, 210);
+  objects.set_database_link = create_content_panel(parent, 3, 126, 300, 210);
   lv_obj_set_style_outline_width(objects.set_database_link, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_outline_color(objects.set_database_link, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_pad_bottom(objects.set_database_link, 100, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -804,7 +826,7 @@ void populate_SettingsPanel(lv_obj_t *parent) {
   objects.set_database_url = create_button_with_font(objects.set_database_link, 3, 157, 290, 40, "Set database URL", &lv_font_montserrat_20, action_send_command, NULL);
 
   // ==================== Open Portal Button ====================
-  objects.open_portal = create_button_with_font(parent, 8, 290, 290, 40, "Open WIFI Portal", &lv_font_montserrat_20, action_send_command, NULL);
+  objects.open_portal = create_button_with_font(parent, 8, 345, 290, 40, "Open WIFI Portal", &lv_font_montserrat_20, action_send_command, NULL);
 }
 
 void create_screen_main(void) {
