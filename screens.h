@@ -74,6 +74,9 @@ extern "C" {
     lv_obj_t *set_machine_id;
     lv_obj_t *machine_id_text_area;
     lv_obj_t *set_new_machine_id;
+    lv_obj_t *set_circemferance;
+    lv_obj_t *circemferance_text_area;
+    lv_obj_t *set_new_circemferance;
     lv_obj_t *set_database_link;
     lv_obj_t *ip_textarea;
     lv_obj_t *port_textarea;
