@@ -1,5 +1,8 @@
 #include <NeoSWSerial.h>
+#include <EEPROM.h>
+#include <math.h>
 
+#define EEPROM_ADDR_CIRC 0
 NeoSWSerial mySerial(11, 12);
 
 #define REVOLUTION_PIN 2
@@ -16,26 +19,29 @@ const uint8_t MIN_PULSES_TO_RESUME = 2;
 
 // ================== MACHINE CONSTANTS ==================
 float Avancement = 2.000f;
-const float INITIAL_DIAMETER = 0.9947f;
+float DRUM_CIRCUMFERENCE_M = 3.125f;
+float getInitialDiameter() {
+  return DRUM_CIRCUMFERENCE_M / 3.14159265f;
+}
 const float TANGENT = 0.1756f;
-const float DRUM_CIRCUMFERENCE_M = 3.15f;
 const float SPEED_CHANGE_THRESHOLD = 0.5f;
 
 // ================== VARIABLES ==================
 volatile uint32_t drumRevolutions = 0;
-volatile uint32_t pulseCount = 0;
 volatile unsigned long lastPulseTime = 0;
 volatile uint8_t recentPulses = 0;
 
 uint32_t lastProcessedRevs = 0;
 float beamLength = 0.0f;
 float minuteLength = 0.0f;
+
 float linearSpeed = 0.0f;
 float lastLinearSpeed = 0.0f;
 
 bool machineRunning = true;
 bool zeroSpeedSent = false;
 bool mainprogramready = false;
+bool stopHandled = false;
 
 unsigned long lastLengthTime = 0;
 unsigned long lastStatusTime = 0;
@@ -55,9 +61,7 @@ enum ProductionStages {
   ENSOUPLAGE,
   REPARATION
 };
-
 ProductionStages prodStage = ENCOUTRAGE;
-
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
@@ -67,6 +71,8 @@ void setup() {
   pinMode(PIN_CHAIN_STOP, INPUT_PULLUP);
 
   attachInterrupt(digitalPinToInterrupt(REVOLUTION_PIN), isrPulse, RISING);
+
+  loadCircumference();
 
   Serial.println("System started");
 }
@@ -81,7 +87,6 @@ void loop() {
 }
 // ================== ISR ==================
 void isrPulse() {
-  pulseCount++;
   drumRevolutions++;
   recentPulses++;
   lastPulseTime = millis();
@@ -96,7 +101,9 @@ void processRevolutions() {
     lastProcessedRevs++;
 
     float N = lastProcessedRevs;
-    float diameter = INITIAL_DIAMETER + (2.0f * N * TANGENT * Avancement / 1000.0f);
+
+    // ✅ FIXED: diameter grows correctly
+    float diameter = getInitialDiameter() + (2.0f * N * TANGENT * Avancement / 1000.0f);
     float lengthThisRev = 3.14159265f * diameter;
 
     beamLength += lengthThisRev;
@@ -141,36 +148,62 @@ void handleSpeed() {
 void handleStopLogic() {
   unsigned long now = millis();
 
-  if ((now - lastPulseTime) >= STOP_TIMEOUT_MS) {
-    if (machineRunning) {
+  bool stopDetected = ((now - lastPulseTime) >= STOP_TIMEOUT_MS);
 
-      if (!digitalRead(PIN_CHAIN_STOP)) {
-        if (prodStage == OURDISSAGE) {
-          mySerial.println("H102");
-          Serial.println("CASSE FIL");
-        }
-      } else {
-        // ===== SECTION COMPLETE =====
-        if (prodStage == OURDISSAGE && targetRevolutions > 0) {
-          // Optional validation (you can relax this if needed)
-          if (drumRevolutions >= targetRevolutions * 0.98f) {
-            windSection++;
-            mySerial.print("Y");
-            mySerial.println(windSection);
-            Serial.print("Section completed → ");
-            Serial.println(windSection);
-            beamLength = 0;
-            drumRevolutions = 0;
-            lastProcessedRevs = 0;
-          } else {
-            mySerial.println("H101");
-            Serial.println("NORMAL STOP");
-          }
+  // ================= STOP DETECTED =================
+  if (stopDetected && machineRunning) {
+
+    // Detect zones
+    bool nearTarget = false;
+    bool atBeginning = (drumRevolutions <= 1);
+
+    if (targetRevolutions > 0) {
+      int remaining = targetRevolutions - drumRevolutions;
+      if (remaining <= 2) nearTarget = true;
+    }
+
+    // Ignore fake stops
+    if (nearTarget || atBeginning) {
+      recentPulses = 0;
+      return;
+    }
+
+    // REAL transition to stopped
+    machineRunning = false;
+    stopHandled = false;  // allow handling once
+    recentPulses = 0;
+  }
+
+  // ================= HANDLE STOP ONCE =================
+  if (stopDetected && !machineRunning && !stopHandled) {
+
+    stopHandled = true;
+
+    if (!digitalRead(PIN_CHAIN_STOP)) {
+      if (prodStage == OURDISSAGE) {
+        mySerial.println("H102");
+        Serial.println("CASSE FIL");
+      }
+    } else {
+      if (prodStage == OURDISSAGE && targetRevolutions > 0) {
+
+        if (drumRevolutions >= targetRevolutions - 1) {
+          windSection++;
+
+          mySerial.print("Y");
+          mySerial.println(windSection);
+
+          Serial.print("Section completed → ");
+          Serial.println(windSection);
+
+          beamLength = 0;
+          drumRevolutions = 0;
+          lastProcessedRevs = 0;
+        } else {
+          mySerial.println("H101");
+          Serial.println("NORMAL STOP");
         }
       }
-
-      machineRunning = false;
-      recentPulses = 0;
     }
 
     if (!zeroSpeedSent) {
@@ -181,9 +214,10 @@ void handleStopLogic() {
     }
   }
 
-  // AUTO RESUME
+  // ================= AUTO RESUME =================
   if (!machineRunning && recentPulses >= MIN_PULSES_TO_RESUME) {
     machineRunning = true;
+    stopHandled = false;  // reset for next stop
     recentPulses = 0;
 
     if (prodStage == OURDISSAGE) {
@@ -232,9 +266,8 @@ void handleSerial() {
     }
   }
 }
-// ================== COMMAND PROCESS ==================
+// ================== COMMAND ==================
 void processCommand(char* cmd) {
-  Serial.println(cmd);
   char command = cmd[0];
   int value = atoi(cmd + 1);
 
@@ -245,59 +278,40 @@ void processCommand(char* cmd) {
       lastProcessedRevs = 0;
       windSection = 1;
       break;
-    case 'A': Avancement = value / 1000.0f; break;
-    case 'L':
-      targetLength = value;  // in meters
-      targetRevolutions = computeTargetRevolutions(targetLength);
 
-      Serial.print("Target Length: ");
-      Serial.println(targetLength);
-
-      Serial.print("Target Revs: ");
-      Serial.println(targetRevolutions);
+    case 'A':
+      Avancement = value / 1000.0f;
       break;
-    case 'S':
-      Serial.println("Received 'S' command, starting program");
-      if (!mainprogramready) {
-        mySerial.println("F1");
-        Serial.println("Sent 'F1' to ESP32-S3");
-        mainprogramready = true;
+    case 'C':
+      {
+        float newCirc = value / 1000.0f;
+        updateCircumference(newCirc);
       }
-      Serial.println("D1");
+      break;
+    case 'L':
+      targetLength = value;
+      targetRevolutions = computeTargetRevolutions(targetLength);
       break;
 
     case 'P':
-      switch (value) {
-        case 103: prodStage = ENCOUTRAGE; break;
-        case 104: prodStage = FIN_ENCOUTRAGE; break;
-        case 106: prodStage = ENCOUTRAGE_PARTIEL; break;
-        case 105: prodStage = NOUAGE; break;
-        case 107: prodStage = PIQUAGE; break;
-        case 109:
-          prodStage = OURDISSAGE;
-          beamLength = 0;
-          drumRevolutions = 0;
-          lastProcessedRevs = 0;
-          minuteLength = 0;
-          windSection = 1;
-          mySerial.println("D1");
-          mySerial.print("Y");
-          mySerial.println(windSection);
-          break;
-        case 111: prodStage = ENSOUPLAGE; break;
-        case 115:
-        case 146:
-        case 147: prodStage = REPARATION; break;
-        default: break;
+      if (value == 109) {
+        prodStage = OURDISSAGE;
+
+        beamLength = 0;
+        drumRevolutions = 0;
+        lastProcessedRevs = 0;
+        minuteLength = 0;
+        windSection = 1;
+
+        mySerial.print("Y");
+        mySerial.println(windSection);
       }
       break;
-
-    default:
-      Serial.println("Invalid command");
   }
 
   STOP_TIMEOUT_MS = (prodStage == ENSOUPLAGE) ? 6000 : 3000;
 }
+// ================== TARGET CALC ==================
 uint32_t computeTargetRevolutions(float targetL) {
   float L = 0.0f;
   uint32_t N = 0;
@@ -305,15 +319,43 @@ uint32_t computeTargetRevolutions(float targetL) {
   while (L < targetL) {
     N++;
 
-    // 👇 KEY FIX: 2.0f × because TANGENT is radial growth, not diameter growth
-    float diameter = INITIAL_DIAMETER + (2.0f * N * TANGENT * Avancement / 1000.0f);
+    float diameter = getInitialDiameter() + (2.0f * N * TANGENT * Avancement / 1000.0f);
     float lengthThisRev = 3.14159265f * diameter;
 
     L += lengthThisRev;
 
-    // Safety limit
     if (N > 9000) break;
   }
 
   return N;
+}
+void updateCircumference(float newValue) {
+  float currentValue;
+  EEPROM.get(EEPROM_ADDR_CIRC, currentValue);
+
+  // Validate stored value
+  bool valid = (currentValue > 0.25f && currentValue < 10.0f);
+
+  if (!valid || fabs(currentValue - newValue) > 0.0005f) {
+
+    EEPROM.put(EEPROM_ADDR_CIRC, newValue);
+    DRUM_CIRCUMFERENCE_M = newValue;
+
+    Serial.println("Circumference updated");
+  } else {
+    Serial.println("No change");
+  }
+}
+void loadCircumference() {
+  float stored;
+  EEPROM.get(EEPROM_ADDR_CIRC, stored);
+  bool valid = (stored > 0.25f && stored < 10.0f);
+  if (valid) {
+    DRUM_CIRCUMFERENCE_M = stored;
+    Serial.println("EEPROM circumference loaded");
+  } else {
+    DRUM_CIRCUMFERENCE_M = 3.125f;
+    EEPROM.put(EEPROM_ADDR_CIRC, DRUM_CIRCUMFERENCE_M);
+    Serial.println("EEPROM initialized with default circumference");
+  }
 }
