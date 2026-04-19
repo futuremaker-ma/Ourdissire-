@@ -34,6 +34,9 @@ unsigned long restartTime = 0;
 bool webServerStarted = false;
 bool updating = false;
 
+bool useMockoon = true;
+String MOCKOON_BASE_URL = "http://192.168.1.122:7272/";
+
 char screenBuffer[64];
 size_t screenBufPos = 0;
 constexpr int BUFFER_SIZE = 16;
@@ -67,13 +70,15 @@ struct MachineState {
   uint8_t previousStopCode = 0;
   uint8_t stageCode = 0;
   unsigned long powerfailTimestamp = 0;
-  int beamLength = 3500;
-  uint8_t windSection = 0;
+  int beamLength = 1212;
+  uint8_t windSection = 1;
   int currentMeters = 0;
   int drumRevs = 0;
+  float circumferance = 3.125;
 
   bool wifiSetupDone = false;
   bool triggerPortal = false;
+  bool initialStateLoaded = false;
 };
 // HTTP Request State
 struct HttpRequestState {
@@ -99,7 +104,6 @@ struct PendingWebRequest {
   uint16_t revolutions = 0;
   unsigned long timestamp = 0;  // when it was queued
 };
-
 struct OurdissoireLive {
   String machineState = "normal_stop";  // running / normal_stop / chain_stop
   int currentMeters = 0;
@@ -132,6 +136,8 @@ DashboardData currentData;
 DashboardData lastSentData;
 uint16_t lastProductionStepCode = 0;
 String lastProductionStepLabel = "";
+unsigned long lastScreenSendTime = 0;
+const unsigned long MIN_SCREEN_SEND_INTERVAL = 20;
 
 WiFiManager wm;
 MachineState state;
@@ -151,6 +157,7 @@ void handleScreenData();
 void processScreenData(const char* data);
 void handleAtmegaData();
 void processAtmegaCommand(const char* cmd);
+void sendCommand(char cmd, int value);
 void UpdateScreen(char prefix, int value);
 // ====== interface web server ========================
 void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions);
@@ -169,6 +176,7 @@ void sendDashboardUpdate();
 void setupWiFi();
 void i2cScanner();
 bool isApiReachable();
+void syncState();
 
 void setup(void) {
   Serial.begin(115200);
@@ -180,6 +188,7 @@ void setup(void) {
 
   Wire.setPins(I2C_SDA, I2C_SCL);
   Wire.begin();
+  Wire.setClock(100000);
   delay(1000);
 
   i2cScanner();
@@ -215,28 +224,34 @@ void setup(void) {
 
   host = "machine" + String(MACHINE_ID);
   {
-    // === Pre-fill default WiFi credentials if nothing is saved ===
+    // === WiFi Setup with clean logic ===
+    Serial.println("Starting WiFi setup...");
+
     if (!wm.getWiFiIsSaved()) {
-      Serial.println("No WiFi credentials found → setting factory defaults");
+      Serial.println("No saved WiFi credentials → setting factory defaults and opening portal");
 
-      const char* defaultSSID = host.c_str();
-      const char* defaultPass = "hikma1234";
+      String defaultSSID = "Machine" + String(MACHINE_ID);
+      String defaultPass = "hikma1234";
 
-      // This forces WiFiManager to save the default credentials
-      bool saved = wm.autoConnect(defaultSSID, defaultPass);
+      // Force save default credentials
+      wm.setConfigPortalTimeout(180);
+      bool saved = wm.autoConnect(defaultSSID.c_str(), defaultPass.c_str());
 
       if (saved) {
-        Serial.printf("Default credentials saved successfully → SSID: %s\n", defaultSSID);
+        Serial.println("Default credentials saved and connected");
       } else {
-        Serial.println("Failed to save default WiFi credentials");
+        Serial.println("Failed to save default credentials");
       }
     } else {
-      Serial.println("WiFi credentials already saved in storage");
+      Serial.println("WiFi credentials already saved in storage → trying to connect");
+      wm.setConfigPortalTimeout(0);  // don't open portal on first try
+      wm.setConnectTimeout(15);
+      wm.autoConnect();  // will open portal only if connection fails
     }
   }
   // Create FreeRTOS task (run on Core 1 - recommended)
-  xTaskCreatePinnedToCore(serialTask, "SerialTask", 14000, NULL, 1, NULL, 0);
-
+  xTaskCreatePinnedToCore(serialTask, "SerialTask", 16384, NULL, 1, NULL, 1);
+  vTaskDelay(200 / portTICK_PERIOD_MS);
 
   for (int attempt = 0; attempt < 3 && !powerFailDetected; attempt++) {
     atmegaSerial.println("S1");
@@ -420,19 +435,19 @@ void handleScreenData() {
   }
 }
 void processScreenData(const char* data) {
-  Serial.printf("RAW: %s\n", data);
+  Serial.printf("RAW from screen: %s\n", data);
 
-  char buffer[200];
-  strncpy(buffer, data, sizeof(buffer));
+  char buffer[256];
+  strncpy(buffer, data, sizeof(buffer) - 1);
   buffer[sizeof(buffer) - 1] = '\0';
 
+  char* cmd = nullptr;
+  char* valueStr = nullptr;
+  char* opid = nullptr;
+  char* avStr = nullptr;  // Only appears with Stage 109
+
   char* token = strtok(buffer, ",");
-
-  char* cmd = NULL;
-  char* value = NULL;
-  char* opid = NULL;
-
-  while (token != NULL) {
+  while (token != nullptr) {
     char* colon = strchr(token, ':');
     if (colon) {
       *colon = '\0';
@@ -440,19 +455,36 @@ void processScreenData(const char* data) {
       char* val = colon + 1;
 
       if (strcmp(key, "cmd") == 0) cmd = val;
-      else if (strcmp(key, "value") == 0) value = val;
+      else if (strcmp(key, "value") == 0) valueStr = val;
       else if (strcmp(key, "OpID") == 0) opid = val;
+      else if (strcmp(key, "Av") == 0) avStr = val;  // Avancement
     }
-    token = strtok(NULL, ",");
+    token = strtok(nullptr, ",");
   }
+
   if (!cmd) return;
 
-  Serial.printf("CMD: %s | VALUE: %s | OpID: %s\n", cmd, value ? value : "NULL", opid ? opid : "NULL");
+  Serial.printf("Parsed → CMD:%s | VALUE:%s | Av:%s | OpID:%s\n", cmd, valueStr ? valueStr : "NULL", avStr ? avStr : "NULL", opid ? opid : "NULL");
 
-  if (strcmp(cmd, "Stage") == 0 && value) {
-    state.stageCode = atoi(value);
-    sendWebRequest(opid, MACHINE_ID, state.stageCode, 0, 0);
-    switch (state.stageCode) {
+  if (strcmp(cmd, "Stage") == 0 && valueStr) {
+    uint8_t stageCode = (uint8_t)atoi(valueStr);
+    state.stageCode = stageCode;
+    // Send to cloud
+    sendWebRequest(opid ? opid : "0", MACHINE_ID, stageCode, 0, 0);
+    // Forward stage to ATmega
+    sendCommand('P', state.stageCode);
+
+    // === Handle Avancement when stage = OURDISSAGE (109) ===
+    if (stageCode == 109 && avStr != nullptr) {
+      float avFloat = atof(avStr);                          // "2.000"
+      int32_t avScaled = (int32_t)round(avFloat * 1000.0);  // 2.000 → 2000
+      Serial.printf("→ Avancement: %s → %.3f → sending A%d to ATmega\n", avStr, avFloat, avScaled);
+      sendCommand('A', avScaled);
+      fetchMachineData();
+      sendCommand('L', state.beamLength);
+    }
+    // Update your stage enum if still used
+    switch (stageCode) {
       case 103: currentStage = ENCANTRAGE; break;
       case 106: currentStage = ENCANTRAGE_PARTIEL; break;
       case 104: currentStage = FIN_ENCANTRAGE; break;
@@ -461,40 +493,42 @@ void processScreenData(const char* data) {
       case 109: currentStage = OURDISSAGE; break;
       case 111: currentStage = ENSOUPLAGE; break;
       case 112: currentStage = FIN_ENSOUPLAGE; break;
-      default: printf("there is no stage that meets this Stage code\n");
     }
-    Serial.printf("Stage: %d\n", currentStage);
-  } else if (strcmp(cmd, "Halt") == 0 && value) {
-    state.stopCode = atoi(value);
-    sendWebRequest(opid, MACHINE_ID, state.stopCode, 0, 0);
+    sendDashboardUpdate();
+  } else if (strcmp(cmd, "Circ") == 0 && valueStr != nullptr) {
+    float circFloat = atof(valueStr);                         // "3.125"
+    int32_t circScaled = (int32_t)round(circFloat * 1000.0);  // 3.125 → 3125
+    Serial.printf("→ Circumference: %s → %.3f → sending C%d to ATmega\n", valueStr, circFloat, circScaled);
+    sendCommand('C', circScaled);
+    sendWebRequest(opid ? opid : "0", MACHINE_ID, 196, circScaled, 0);
+    sendDashboardUpdate();
+  } else if (strcmp(cmd, "Halt") == 0 && valueStr) {
+    state.stopCode = atoi(valueStr);
+    sendWebRequest(opid ? opid : "0", MACHINE_ID, state.stopCode, 0, 0);
+
     if (state.stopCode == 146 || state.stopCode == 147 || state.stopCode == 115) {
       state.onRepaire = true;
+      sendCommand('P', state.stopCode);
     } else {
       state.onRepaire = false;
     }
-  } else if (strcmp(cmd, "machID") == 0 && value) {
-    int id = atoi(value);
+    sendDashboardUpdate();
+  } else if (strcmp(cmd, "machID") == 0 && valueStr) {
+    int id = atoi(valueStr);
     if (id >= 0 && id <= 255) {
       MACHINE_ID = id;
       preferences.begin("app-config", false);
       preferences.putUChar("machine_id", id);
       preferences.end();
-    }
-  } else if (strcmp(cmd, "URL") == 0 && value) {
-    String url = value;
-    if (url.startsWith("http://") || url.startsWith("https://")) {
-      API_BASE_URL = url;
-      preferences.begin("app-config", false);
-      preferences.putString("api_url", url);
-      preferences.end();
+      Serial.printf("Machine ID updated to %d\n", id);
     }
   } else if (strcmp(cmd, "Data") == 0) {
-    UpdateScreen('N', MACHINE_ID);
-    UpdateScreen('O', state.stageCode);
-    UpdateScreen('X', state.wifiConnected == true ? 1 : 0);
-    UpdateScreen('H', state.stopCode);
+    // Refresh screen with current values
+    fetchMachineData();
+    syncState();
   } else if (strcmp(cmd, "Portal") == 0) {
-    Serial.println("open wifi provesioning Portal");
+    // Refresh screen with current values
+    Serial.println("open wifi provesioning portal of wifi manager");
   }
 }
 
@@ -511,16 +545,11 @@ void handleAtmegaData() {
       int value = (bufferIndex > 1) ? atoi(commandBuffer + 1) : 0;
       if (prefix == 'F') {
         powerFailDetected = true;
+        sendCommand('P', state.stageCode);
+        sendCommand('Y', state.windSection);
         Serial.println("Power fail forced!");
       } else if (prefix == 'R' || prefix == 'M' || prefix == 'S' || prefix == 'A') {
         UpdateScreen(prefix, value);
-        if (prefix == 'M') {
-          if (value >= state.beamLength + 10) {
-            state.windSection++;
-            UpdateScreen('Y', state.windSection);
-            atmegaSerial.println("R1");
-          }
-        }
       } else {
         processAtmegaCommand(commandBuffer);
       }
@@ -549,14 +578,30 @@ void processAtmegaCommand(const char* cmd) {
       Serial.printf("Stop code received: %d\n", value);
       break;
     case 'L':
-      sendWebRequest("0", MACHINE_ID, 94, 0, value);
+      sendWebRequest("0", MACHINE_ID, 194 /*94*/, value, 0);
       Serial.printf("chunk Length per minute %d\n", value);
+      break;
+    case 'Y':
+      state.windSection = value;
+      sendWebRequest("0", MACHINE_ID, 195, state.windSection, 0);
+      break;
+    case 'D':
+      syncState();
+      if (state.stopCode == 146 || state.stopCode == 147 || state.stopCode == 115) {
+        sendCommand('P', state.stopCode);
+      }
       break;
     default: Serial.printf("Unknown command from Atmega: %s\n", cmd); break;
   }
 
   // Now send to screen using the new signature
   UpdateScreen(prefix, value);
+  sendDashboardUpdate();
+}
+void sendCommand(char cmd, int value) {
+  atmegaSerial.print(cmd);
+  atmegaSerial.print(value);
+  atmegaSerial.print('\n');  // optional
 }
 
 //========== Update screen Data display ====================
@@ -583,28 +628,47 @@ void UpdateScreen(char prefix, int value) {
   screenCommandQueue.push(std::move(commandStr));
 
   // debug
-  // Serial.printf("Queued for screen: %s\n", cmd);
+  Serial.printf("Queued for screen: %s\n", cmd);
 }
 void sendScreenCommand() {
   if (screenCommandQueue.empty()) return;
 
+  // Rate limit: don't spam I2C too fast
+  if (millis() - lastScreenSendTime < MIN_SCREEN_SEND_INTERVAL) {
+    return;
+  }
+
   String cmd = screenCommandQueue.front();
   screenCommandQueue.pop();
 
-  // Force clean state before every write
-  Wire.end();
-  delayMicroseconds(100);
-  Wire.begin();  // re-init
+  // Optional: skip duplicate consecutive commands (very useful)
+  static String lastSentCmd = "";
+  if (cmd == lastSentCmd) {
+    // Still pop it but don't send again
+    lastSentCmd = cmd;  // update anyway
+    lastScreenSendTime = millis();
+    return;
+  }
+  lastSentCmd = cmd;
 
-  Wire.beginTransmission(SCREEN_I2C_ADDR);  // 0x08
+  // === Send via I2C with proper error checking ===
+  Wire.beginTransmission(SCREEN_I2C_ADDR);
   Wire.write((const uint8_t*)cmd.c_str(), cmd.length());
-  Wire.write('\n');
-  uint8_t error = Wire.endTransmission(true);  // true = send stop
+  Wire.write('\n');                            // Your HMI expects this
+  uint8_t error = Wire.endTransmission(true);  // true = STOP
+
+  // === DEBUG: See EVERYTHING that is actually sent ===
+  Serial.printf("I2C→Screen | '%s' | len=%d | err=%d | queue left=%d\n", cmd.c_str(), cmd.length(), error, screenCommandQueue.size());
 
   if (error != 0) {
-    Serial.printf("I2C Error (%d) sending '%s'\n", error, cmd.c_str());
+    Serial.printf("  → I2C ERROR %d (2=addr NACK, 3=data NACK, 4=other)\n", error);
+    // Optional: push it back to queue for retry (careful not to loop forever)
+    screenCommandQueue.push(cmd);
+  } else {
+    Serial.println("  → SUCCESS");
   }
-  // else success (you can uncomment a print if you want confirmation)
+
+  lastScreenSendTime = millis();
 }
 
 //========== Handle server and coude data exchange =========
@@ -630,7 +694,16 @@ void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int
   httpState.active = true;
   httpState.retryCount = 0;
   httpState.startTime = millis();
-  snprintf(httpState.url, sizeof(httpState.url), "%sRecording_Events_Api.php", API_BASE_URL.c_str());
+
+  // snprintf(httpState.url, sizeof(httpState.url), "%sRecording_Events_Api.php", API_BASE_URL.c_str());
+  String baseUrl = useMockoon ? MOCKOON_BASE_URL : API_BASE_URL;
+
+  if (httpState.isFetchMachineData) {
+    snprintf(httpState.url, sizeof(httpState.url), "%sgetMachineData", baseUrl.c_str());
+  } else {
+    snprintf(httpState.url, sizeof(httpState.url), "%sPostMachineData", baseUrl.c_str());  // or whatever your real endpoint path is
+  }
+
   httpState.http->setTimeout(httpState.HTTP_TIMEOUT_MS);
   httpState.http->setConnectTimeout(5000);
   httpState.http->begin(httpState.url);
@@ -677,7 +750,15 @@ void fetchMachineData() {
   httpState.active = true;
   httpState.retryCount = 0;
 
-  snprintf(httpState.url, sizeof(httpState.url), "%sGet_Speed_and_Perfommence.php", API_BASE_URL.c_str());
+  // snprintf(httpState.url, sizeof(httpState.url), "%sGet_Speed_and_Perfommence.php", API_BASE_URL.c_str());
+
+  String baseUrl = useMockoon ? MOCKOON_BASE_URL : API_BASE_URL;
+
+  if (httpState.isFetchMachineData) {
+    snprintf(httpState.url, sizeof(httpState.url), "%sgetMachineData", baseUrl.c_str());
+  } else {
+    snprintf(httpState.url, sizeof(httpState.url), "%sPostMachineData", baseUrl.c_str());  // or whatever your real endpoint path is
+  }
 
   httpState.http->setTimeout(httpState.HTTP_TIMEOUT_MS);
   httpState.http->setConnectTimeout(5000);
@@ -709,21 +790,36 @@ void handleWebRequest() {
     Serial.printf(F("HTTP %s | Code: %d | Body: %s\n"), httpState.isFetchMachineData ? "FETCH" : "EVENT", responseCode, payload.c_str());
 
     if (responseCode > 0) {
+      // ==================== INSIDE handleWebRequest() ====================
       if (httpState.isFetchMachineData) {
-        StaticJsonDocument<300> responseDoc;
-        if (deserializeJson(responseDoc, payload) == DeserializationError::Ok) {
-          state.previousStopCode = responseDoc["LastCodeStop"].as<int>();
-          String label = responseDoc["LastCodeLabel"].as<String>();
-          state.performance = responseDoc["performance"].as<float>();
-          state.beamLength = responseDoc["speed"].as<int>();
-          state.stageCode = responseDoc["lainID"].as<int>();
+        StaticJsonDocument<400> responseDoc;  // increased size a bit for safety
+        DeserializationError error = deserializeJson(responseDoc, payload);
 
-          if (state.previousStopCode >= 100) {
-            UpdateScreen('H', state.previousStopCode);
-            if (state.previousStopCode == 146 || state.previousStopCode == 147 || state.previousStopCode == 115) {
-              state.onRepaire = true;
-            }
+        if (error == DeserializationError::Ok) {
+
+          // === Extract previous state from server ===
+          state.stopCode = responseDoc["previousStopCode"].as<int>();  // 100 = running
+          state.stageCode = responseDoc["stage"].as<int>();
+          state.windSection = responseDoc["section"].as<int>();
+          state.beamLength = responseDoc["beamLength"].as<int>();
+          state.performance = responseDoc["performance"].as<float>();
+          state.circumferance = responseDoc["circumferance"].as<float>();
+
+          Serial.printf("Initial state loaded from server → Stop:%d | Stage:%d | Section:%d | Beam:%d | Perf:%.1f | Cercumferance:%.3f\n", state.stopCode, state.stageCode, state.windSection, state.beamLength, state.performance, state.circumferance);
+
+          UpdateScreen('P', (int)(state.performance * 10));  // if you want performance as P85.0
+          if (state.stageCode == 109) {
+            sendCommand('L', state.beamLength);
+            sendCommand('C', (int)(state.circumferance * 1000));
           }
+          // === Send full initial state to CYD screen (only once) ===
+          if (!state.initialStateLoaded) {
+            syncState();
+            sendDashboardUpdate();
+            state.initialStateLoaded = true;
+          }
+        } else {
+          Serial.printf("JSON parse error: %s\n", error.c_str());
         }
       }
       success = true;
@@ -839,6 +935,7 @@ void setupWiFi() {
     resetMDNS();
     handleWebServer();
     fetchMachineData();
+    state.initialStateLoaded = false;
   } else {
     Serial.println("❌ WiFi connection failed or portal timed out");
     state.wifiConnected = false;
@@ -930,7 +1027,7 @@ void handleWebServer() {
       // updateScreen('H', 0);
       UpdateScreen('M', 0);
       // Send reset command to ATmega with explicit newline
-      atmegaSerial.print("R\n");  // use print + \n instead of println for clarity
+      sendCommand('R', 1);
       Serial.println(">>> WEB RESET: Sent 'R\\n' to ATmega");
 
       server.send(200, "text/plain", "OK: Reset sent");
@@ -1135,40 +1232,41 @@ void resetMDNS() {
     MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
   }
 }
+// ==================== IMPROVED DASHBOARD SYNCHRONIZATION ====================
 void sendDashboardUpdate() {
-  bool changed = currentData.changed(lastSentData);
-
-  if (liveData.machineState != lastLiveSent.machineState || liveData.currentMeters != lastLiveSent.currentMeters || abs(liveData.linearSpeed - lastLiveSent.linearSpeed) > 0.01f || liveData.drumRPM != lastLiveSent.drumRPM) {
-    changed = true;
-  }
-
-  if (!changed) return;
-
   StaticJsonDocument<512> doc;
 
-  // Original fields
-  doc["speed"] = currentData.revolutions;
-  doc["performance"] = roundf(currentData.performance * 10.0f) / 10.0f;
-  doc["LastCodeStop"] = currentData.lastCodeStop;
-  doc["LastCodeLabel"] = currentData.lastCodeLabel;
-  doc["wifi"] = currentData.wifiConnected;
+  // === Main Machine Status ===
+  doc["haltCode"] = state.stopCode;
+  doc["prodStep"] = state.stageCode;  // used as prodStep in JS
+
+  // Labels for better display
+  doc["LastCodeLabel"] = (state.stopCode == 100) ? "RUNNING" : "ARRÊT";
+  doc["productionStepLabel"] = getStageLabel(state.stageCode);
+
+  // Core metrics
+  doc["performance"] = roundf(state.performance * 10.0f) / 10.0f;
+  doc["currentMeters"] = state.beamLength;  // most logical field for "Total Beam Length"
+  doc["windSection"] = state.windSection;
+
+  // WiFi status
+  doc["wifi"] = state.wifiConnected;
+
+  // Live data from ATmega (update these when you receive data from sensors)
+  doc["linearSpeed"] = liveData.linearSpeed;  // will be 0 until you fill it
+  doc["drumRPM"] = liveData.drumRPM;
+  doc["totalRevs"] = state.drumRevs;  // if you track it
+
+  // Extra flags
+  doc["onRepaire"] = state.onRepaire;
   doc["updating"] = updating;
 
-  doc["currentProductionStep"] = lastProductionStepCode;  // e.g. 109
-  doc["productionStepLabel"] = lastProductionStepLabel;   // e.g. "Ourdissage"
+  String jsonStr;
+  serializeJson(doc, jsonStr);
 
-  // Ourdissoire live data
-  doc["state"] = liveData.machineState;
-  doc["currentMeters"] = liveData.currentMeters;
-  doc["linearSpeed"] = roundf(liveData.linearSpeed * 100.0f) / 100.0f;
-  doc["drumRPM"] = liveData.drumRPM;
+  webSocket.broadcastTXT(jsonStr);
 
-  String json;
-  serializeJson(doc, json);
-  webSocket.broadcastTXT(json);
-
-  lastSentData = currentData;
-  lastLiveSent = liveData;
+  Serial.printf("[WS] Broadcast → halt:%d | stage:%d | perf:%.1f | beam:%d | wifi:%d\n", state.stopCode, state.stageCode, state.performance, state.beamLength, state.wifiConnected);
 }
 
 // ========= mescelineouce functions ======================
@@ -1234,5 +1332,30 @@ bool isApiReachable() {
   } else {
     Serial.printf(F(" Gateway unreachable → WiFi/network issue\n"));
     return false;
+  }
+}
+void syncState() {
+  UpdateScreen('N', MACHINE_ID);
+  UpdateScreen('O', state.stageCode);
+  UpdateScreen('X', state.wifiConnected ? 1 : 0);
+  UpdateScreen('H', state.stopCode);
+  UpdateScreen('Y', state.windSection);
+  UpdateScreen('P', (int)(state.performance * 10));
+  sendCommand('P', state.stageCode);
+  if (state.stageCode == 109) {
+    sendCommand('L', state.beamLength);
+  }
+}
+String getStageLabel(uint8_t code) {
+  switch (code) {
+    case 103: return "Encantage";
+    case 106: return "Encantage Partiel";
+    case 104: return "Fin Encantage";
+    case 105: return "Nouage";
+    case 107: return "Piquage";
+    case 109: return "Ourdissage";
+    case 111: return "Ensouplage";
+    case 112: return "Fin Ensouplage";
+    default: return "Inconnu";
   }
 }
