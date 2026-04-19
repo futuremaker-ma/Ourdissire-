@@ -1,127 +1,127 @@
 #ifndef WEBINTERFACE_H
 #define WEBINTERFACE_H
 
-const char* customWiFiSetupPage = R"rawliteral(
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Machine %MACHINE_ID% - WiFi Setup</title>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>
-            /* Reuse your existing :root variables and styles from other pages */
-            :root {
-                --bg-gradient: linear-gradient(135deg, #f8fafc 0%, #e9ecef 100%);
-                --card-bg: #ffffff;
-                --primary: #0f172a;
-                --accent: #3b82f6;
-                --danger: #ef4444;
-                --text: #1e293b;
-                --text-secondary: #64748b;
-                --shadow-lg: 0 20px 25px -5px rgba(0,0,0,0.15);
-                --radius-lg: 24px;
-            }
-            body {
-                font-family: system-ui, sans-serif;
-                background: var(--bg-gradient);
-                min-height: 100vh;
-                margin: 0;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 1rem;
-                color: var(--text);
-            }
-            .container {
-                background: var(--card-bg);
-                border-radius: var(--radius-lg);
-                box-shadow: var(--shadow-lg);
-                padding: 2rem;
-                width: 100%;
-                max-width: 460px;
-            }
-            h1 { text-align: center; color: var(--primary); margin-bottom: 1.5rem; }
-            label { display: block; margin: 1rem 0 0.4rem; font-weight: 600; }
-            select, input[type="text"], input[type="password"] {
-                width: 100%;
-                padding: 0.8rem;
-                border: 1px solid #d1d5db;
-                border-radius: 8px;
-                font-size: 1rem;
-            }
-            button {
-                width: 100%;
-                padding: 1rem;
-                margin-top: 1.5rem;
-                background: var(--accent);
-                color: white;
-                border: none;
-                border-radius: 8px;
-                font-size: 1rem;
-                cursor: pointer;
-            }
-            button:hover { background: #2563eb; }
-            #status { margin-top: 1rem; text-align: center; min-height: 1.3em; }
-            .error { color: var(--danger); }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1><i class="fas fa-wifi"></i> WiFi Setup</h1>
-            <p style="text-align:center; color:var(--text-secondary);">Machine %MACHINE_ID%</p>
-            
-            <form id="wifiForm">
-                <label for="ssid">Network (SSID)</label>
-                <select id="ssid" name="ssid" required>
-                    <option value="">Select network...</option>
-                    %WIFI_LIST%
-                </select>
+// const char* WiFiSetupPage = R"rawliteral(
+//     <!DOCTYPE html>
+//     <html lang="en">
+//     <head>
+//         <meta charset="UTF-8">
+//         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+//         <title>Machine %MACHINE_ID% - WiFi Setup</title>
+//         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+//         <style>
+//             /* Reuse your existing :root variables and styles from other pages */
+//             :root {
+//                 --bg-gradient: linear-gradient(135deg, #f8fafc 0%, #e9ecef 100%);
+//                 --card-bg: #ffffff;
+//                 --primary: #0f172a;
+//                 --accent: #3b82f6;
+//                 --danger: #ef4444;
+//                 --text: #1e293b;
+//                 --text-secondary: #64748b;
+//                 --shadow-lg: 0 20px 25px -5px rgba(0,0,0,0.15);
+//                 --radius-lg: 24px;
+//             }
+//             body {
+//                 font-family: system-ui, sans-serif;
+//                 background: var(--bg-gradient);
+//                 min-height: 100vh;
+//                 margin: 0;
+//                 display: flex;
+//                 align-items: center;
+//                 justify-content: center;
+//                 padding: 1rem;
+//                 color: var(--text);
+//             }
+//             .container {
+//                 background: var(--card-bg);
+//                 border-radius: var(--radius-lg);
+//                 box-shadow: var(--shadow-lg);
+//                 padding: 2rem;
+//                 width: 100%;
+//                 max-width: 460px;
+//             }
+//             h1 { text-align: center; color: var(--primary); margin-bottom: 1.5rem; }
+//             label { display: block; margin: 1rem 0 0.4rem; font-weight: 600; }
+//             select, input[type="text"], input[type="password"] {
+//                 width: 100%;
+//                 padding: 0.8rem;
+//                 border: 1px solid #d1d5db;
+//                 border-radius: 8px;
+//                 font-size: 1rem;
+//             }
+//             button {
+//                 width: 100%;
+//                 padding: 1rem;
+//                 margin-top: 1.5rem;
+//                 background: var(--accent);
+//                 color: white;
+//                 border: none;
+//                 border-radius: 8px;
+//                 font-size: 1rem;
+//                 cursor: pointer;
+//             }
+//             button:hover { background: #2563eb; }
+//             #status { margin-top: 1rem; text-align: center; min-height: 1.3em; }
+//             .error { color: var(--danger); }
+//         </style>
+//     </head>
+//     <body>
+//         <div class="container">
+//             <h1><i class="fas fa-wifi"></i> WiFi Setup</h1>
+//             <p style="text-align:center; color:var(--text-secondary);">Machine %MACHINE_ID%</p>
 
-                <label for="pass">Password</label>
-                <input type="password" id="pass" name="pass" placeholder="Enter password" required>
+//             <form id="wifiForm">
+//                 <label for="ssid">Network (SSID)</label>
+//                 <select id="ssid" name="ssid" required>
+//                     <option value="">Select network...</option>
+//                     %WIFI_LIST%
+//                 </select>
 
-                <button type="submit">Connect</button>
-            </form>
+//                 <label for="pass">Password</label>
+//                 <input type="password" id="pass" name="pass" placeholder="Enter password" required>
 
-            <div id="status"></div>
-        </div>
+//                 <button type="submit">Connect</button>
+//             </form>
 
-        <script>
-            const form = document.getElementById('wifiForm');
-            const status = document.getElementById('status');
+//             <div id="status"></div>
+//         </div>
 
-            form.onsubmit = async (e) => {
-                e.preventDefault();
-                status.textContent = 'Connecting...';
-                status.className = '';
+//         <script>
+//             const form = document.getElementById('wifiForm');
+//             const status = document.getElementById('status');
 
-                const ssid = document.getElementById('ssid').value;
-                const pass = document.getElementById('pass').value;
+//             form.onsubmit = async (e) => {
+//                 e.preventDefault();
+//                 status.textContent = 'Connecting...';
+//                 status.className = '';
 
-                try {
-                    const res = await fetch('/save_wifi', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                        body: `ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}`
-                    });
+//                 const ssid = document.getElementById('ssid').value;
+//                 const pass = document.getElementById('pass').value;
 
-                    if (res.ok) {
-                        status.textContent = 'Success! Rebooting...';
-                        setTimeout(() => location.href = '/', 3000);
-                    } else {
-                        status.textContent = 'Failed – wrong password or network issue';
-                        status.className = 'error';
-                    }
-                } catch (err) {
-                    status.textContent = 'Connection error';
-                    status.className = 'error';
-                }
-            };
-        </script>
-    </body>
-    </html>
-)rawliteral";
+//                 try {
+//                     const res = await fetch('/save_wifi', {
+//                         method: 'POST',
+//                         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+//                         body: `ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}`
+//                     });
+
+//                     if (res.ok) {
+//                         status.textContent = 'Success! Rebooting...';
+//                         setTimeout(() => location.href = '/', 3000);
+//                     } else {
+//                         status.textContent = 'Failed – wrong password or network issue';
+//                         status.className = 'error';
+//                     }
+//                 } catch (err) {
+//                     status.textContent = 'Connection error';
+//                     status.className = 'error';
+//                 }
+//             };
+//         </script>
+//     </body>
+//     </html>
+// )rawliteral";
 
 const char* loginIndex = R"rawliteral(
     <!DOCTYPE html>
@@ -593,10 +593,14 @@ const char* serverIndex = R"rawliteral(
                     box-shadow: none;
                 }
                 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.3rem; padding: 1.5rem; }
-                .big-metric, .metric { background: #f9fafb; border-radius: 16px; padding: 1.5rem; text-align: center; border: 1px solid var(--border); box-shadow: 0 4px 12px rgba(0,0,0,0.04); }
+                .big-metric, .metric { background: #f9fafb; border-radius: 16px; padding: 1.5rem; text-align: center; border: 1px solid var(--border); box-shadow: 0 4px 12px rgba(0,0,0,0.04); transition: opacity 0.3s ease; }
                 .big-metric { grid-column: 1 / -1; }
+                .metric.hidden, .big-metric.hidden {
+                    display: none !important;
+                }
                 .label { font-size:1rem; color: var(--text-secondary); font-weight: 700; margin-bottom: 0.8rem; }
                 .value { font-size: 3.1rem; font-weight: 800; line-height: 1; }
+                .unit { font-size: 0.9rem; color: var(--text-secondary); margin-top: 0.3rem; }
                 .perf-container { height: 50px; background: #f1f5f9; border-radius: 16px; overflow: hidden; position: relative; box-shadow: inset 0 2px 6px rgba(0,0,0,0.08); border: 1px solid var(--border); }
                 #perfBar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent-hover)); transition: width 1.2s cubic-bezier(0.165, 0.84, 0.44, 1); position: relative; }
                 #perfBar::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent); animation: shimmer 2.8s infinite; }
@@ -605,6 +609,7 @@ const char* serverIndex = R"rawliteral(
                 .controls { padding: 1.5rem; display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.1rem; border-top: 1px solid var(--border); }
                 button { padding: 1rem; border: none; border-radius: 12px; font-size: 1.05rem; font-weight: 600; cursor: pointer; color: white; transition: var(--transition); }
                 button:hover { transform: translateY(-2px); }
+                button:disabled { opacity: 0.6; cursor: not-allowed; transform: none !important; }
                 button.mauve   { background: linear-gradient(90deg, #4f46e5, #7c3aed); }
                 button.amber   { background: linear-gradient(90deg, var(--warning), #d97706); }
                 button.danger  { background: linear-gradient(90deg, var(--danger), #dc2626); }
@@ -666,13 +671,13 @@ const char* serverIndex = R"rawliteral(
                     </div>
 
                     <div class="metric">
-                        <div class="label">Total Beam Length</div>
+                        <div class="label">Beam Length</div>
                         <div class="value" id="currentMeters">0</div>
-                        <div class="unit">meters</div>
+                        <div class="unit">m</div>
                     </div>
 
                     <div class="metric">
-                        <div class="label">Total Drum Revolutions</div>
+                        <div class="label">Revolutions</div>
                         <div class="value" id="totalRevs">0</div>
                         <div class="unit">Revs</div>
                     </div>
@@ -685,7 +690,7 @@ const char* serverIndex = R"rawliteral(
 
                     <div class="metric">
                         <div class="label">Rotational Speed</div>
-                        <div class="value" id="rotSpeed">0</div>
+                        <div class="value" id="rotSpeed">0.00</div>
                         <div class="unit">RPM</div>
                     </div>
                 </div>
@@ -705,150 +710,223 @@ const char* serverIndex = R"rawliteral(
 
             <script>
                 let ws = null;
-                let haltCode=null;
                 window.startTime = Date.now();
 
                 function getToken() {
                     const t = localStorage.getItem('sessionToken');
-                    if (!t) { alert('Session expired'); location.href = '/'; }
+                    if (!t) { 
+                        console.warn('⚠️ Session expired');
+                        location.href = '/'; 
+                        return '';
+                    }
                     return t;
+                }
+
+                // === STOP CODE LABELS (from your halt_reasons[] array) ===
+                function getStopLabel(code) {
+                    const labels = {
+                        100: "EN MARCHE",
+                        101: "ARRET NORMAL",
+                        102: "CASSE FIL",
+                        113: "PAUSE",
+                        114: "FIN PAUSE",
+                        115: "REPARATION OPERATEUR",
+                        121: "ATTENTE MECANIQUE",
+                        122: "FIN REPARATION MECANIQUE",
+                        123: "ATTENTE ELECTRIQUE",
+                        124: "FIN REPARATION ELECTRIQUE",
+                        146: "REPARATION MECANIQUE",
+                        147: "REPARATION ELECTRIQUE",
+                        default: (c) => `Code ${c}`
+                    };
+                    return labels[code] || (labels.default ? labels.default(code) : `Code ${code}`);
+                }
+
+                // === TIMELINE: Group stages to steps ===
+                // First 3 codes (103,106,104) → Step 0 (Encantrage)
+                function getStepIndex(stageCode) {
+                    if ([103, 106, 104].includes(stageCode)) return 0;  // Encantrage group
+                    if (stageCode === 105) return 1;                     // Nouage
+                    if (stageCode === 107) return 2;                     // Piquage  
+                    if (stageCode === 109) return 3;                     // Ourdissage
+                    if ([111, 112].includes(stageCode)) return 4;        // Ensouplage group
+                    return -1;
                 }
 
                 function connectWS() {
                     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-                    ws = new WebSocket(`${proto}://${location.hostname}:81/`);
+                    const wsUrl = `${proto}://${location.hostname}:81/`;
+                    console.log(`🔌 Connecting to ${wsUrl}`);
+                    
+                    if (ws) { ws.onclose = null; ws.close(); }
+                    
+                    ws = new WebSocket(wsUrl);
+
+                    ws.onopen = () => {
+                        console.log('✅ WebSocket connected');
+                        document.getElementById('wifiIcon').innerHTML = '<i class="fas fa-wifi"></i>';
+                    };
 
                     ws.onmessage = (e) => {
                         try {
                             const d = JSON.parse(e.data);
-
-                            // ✅ Extract values safely
-                            const haltCode = d.haltCode ?? 0;
-                            const prodStep = d.prodStep ?? 0;
-
-                            const prodCodes = [103,105,107,109,111];
-
-                            const steps = document.querySelectorAll(".step");
-                            const timelineProgress = document.getElementById("timelineProgress");
-
-                            const stateBar  = document.getElementById("stateBar");
-                            const stateText = document.getElementById("stateText");
-                            const stateIcon = document.getElementById("stateIcon");
-
-                            /* =========================
-                            STATE BAR (Machine Only)
-                            ========================= */
-
-                            stateBar.classList.remove("running","stopped","idle");
-
-                            if (haltCode === 0) {
-                                stateBar.classList.add("running");
-                                stateIcon.className = "fas fa-play-circle";
-                                stateText.textContent = "EN MARCHE";
-                            } else {
-                                stateBar.classList.add("stopped");
-                                stateIcon.className = "fas fa-circle-stop";
-                                stateText.textContent = d.LastCodeLabel
-                                    ? d.LastCodeLabel.toUpperCase()
-                                    : "ARRÊT (" + haltCode + ")";
-                            }
-
-                            /* =========================
-                            TIMELINE (Production Only)
-                            ========================= */
-
-                            steps.forEach(s => s.classList.remove("completed","active"));
-
-                            const idx = prodCodes.indexOf(prodStep);
-
-                            if (idx !== -1) {
-                                steps.forEach((s,i) => {
-                                    if (i < idx) s.classList.add("completed"); // 🟢 past
-                                    if (i === idx) s.classList.add("active");  // 🟡 current
-                                });
-
-                                timelineProgress.style.width =
-                                    (idx / (prodCodes.length - 1)) * 100 + "%";
-                            } else {
-                                timelineProgress.style.width = "0%";
-                            }
-
-                            /* =========================
-                            METRICS
-                            ========================= */
-
-                            if (d.currentMeters !== undefined)
-                                document.getElementById('currentMeters').textContent = d.currentMeters;
-
-                            if (d.linearSpeed !== undefined) {
-                                const ls = d.linearSpeed;
-                                document.getElementById('linearSpeed').textContent = ls.toFixed(2);
-                                const rpm = (ls * 60) / 3.125;
-                                document.getElementById('rotSpeed').textContent = Math.round(rpm);
-                            }
-
-                            if (d.drumRPM !== undefined)
-                                document.getElementById('totalRevs').textContent = d.drumRPM;
-
-                            if (d.performance !== undefined) {
-                                const perf = Math.min(Math.max(Math.round(d.performance * 10) / 10, 0), 100);
-                                document.getElementById('performance').textContent = perf;
-                                document.getElementById('perfBar').style.width = perf + '%';
-                            }
-
-                            if (d.wifi !== undefined) {
-                                const icon = document.getElementById('wifiIcon');
-                                icon.innerHTML = d.wifi
-                                    ? '<i class="fas fa-wifi"></i>'
-                                    : '<i class="fas fa-wifi-slash"></i>';
-                            }
-
+                            updateDashboard(d);
                         } catch (err) {
-                            console.error('WS parse error:', err);
+                            console.error('❌ WS parse error:', err, 'Raw:', e.data?.substring(0, 150));
                         }
                     };
 
-                    ws.onclose = () => setTimeout(connectWS, 3000);
+                    ws.onclose = (e) => {
+                        console.warn(`⚠️ WS closed (code ${e.code}), reconnecting in 3s`);
+                        document.getElementById('wifiIcon').innerHTML = '<i class="fas fa-wifi-slash"></i>';
+                        setTimeout(connectWS, 3000);
+                    };
+
+                    ws.onerror = (err) => console.error('❌ WS error:', err);
                 }
-                connectWS();
 
-                setInterval(() => {
-                    const elapsed = Math.floor((Date.now() - window.startTime) / 1000);
-                    const h = Math.floor(elapsed / 3600);
-                    const m = Math.floor((elapsed % 3600) / 60);
-                    const s = elapsed % 60;
-                    document.getElementById('uptime').textContent =
-                        (h > 0 ? h + 'h ' : '') + m + 'm ' + s + 's';
-                }, 1000);
+                function updateDashboard(d) {
+                    const stateBar = document.getElementById("stateBar");
+                    const stateText = document.getElementById("stateText");
+                    const stateIcon = document.getElementById("stateIcon");
+                    
+                    stateBar.classList.remove("running", "stopped", "idle");
+                    const stopCode = d.stopCode ?? 100;
+                    
+                    if (stopCode === 100) {
+                        stateBar.classList.add("running");
+                        stateIcon.className = "fas fa-play-circle";
+                        stateText.textContent = "EN MARCHE";
+                    } else {
+                        stateBar.classList.add("stopped");
+                        stateIcon.className = "fas fa-circle-stop";
+                        // ✅ Always use the JS lookup table
+                        stateText.textContent = getStopLabel(stopCode).toUpperCase();
+                    }
 
-                document.getElementById('resetBtn').onclick = () => {
+                    // === TIMELINE ===
+                    const prodStep = d.prodStep ?? 0;
+                    const steps = document.querySelectorAll(".step");
+                    const timelineProgress = document.getElementById("timelineProgress");
+                    
+                    steps.forEach(s => s.classList.remove("completed", "active"));
+                    const idx = getStepIndex(prodStep);
+                    
+                    if (idx !== -1) {
+                        steps.forEach((s, i) => {
+                            if (i < idx) s.classList.add("completed");
+                            if (i === idx) s.classList.add("active");
+                        });
+                        const progress = steps.length > 1 ? (idx / (steps.length - 1)) * 100 : 100;
+                        timelineProgress.style.width = `${Math.min(progress, 100)}%`;
+                    } else {
+                        timelineProgress.style.width = "0%";
+                    }
+
+                    // === METRIC CARDS VISIBILITY (only during Ourdissage = stage 109) ===
+                    const isOurdissage = prodStep === 109;
+                    const ourdissageMetrics = ['currentMeters', 'totalRevs', 'linearSpeed', 'rotSpeed'];
+                    
+                    ourdissageMetrics.forEach(id => {
+                        const card = document.getElementById(id)?.closest('.metric');
+                        if (card) card.classList.toggle('hidden', !isOurdissage);
+                    });
+
+                    // === METRICS VALUES (update always, visibility handled by CSS) ===
+                    const setVal = (id, val, formatter = v => v) => {
+                        const el = document.getElementById(id);
+                        if (el && val !== undefined && val !== null) {
+                            el.textContent = formatter(val);
+                        }
+                    };
+
+                    setVal('currentMeters', d.currentMeters, v => Math.round(v));
+                    setVal('totalRevs', d.drumRPM, v => Math.round(v));
+                    
+                    if (d.linearSpeed !== undefined) {
+                        setVal('linearSpeed', d.linearSpeed, v => parseFloat(v).toFixed(2));
+                    }
+                    if (d.angularSpeed !== undefined) {
+                        // Your scaling: ESP32 sends value/100 → display as decimal (e.g., 1234 → 12.34)
+                        setVal('rotSpeed', d.angularSpeed, v => parseFloat(v).toFixed(2));
+                    }
+
+                    if (d.performance !== undefined) {
+                        const perf = Math.min(Math.max(Math.round(d.performance * 10) / 10, 0), 100);
+                        setVal('performance', perf);
+                        const bar = document.getElementById('perfBar');
+                        if (bar) bar.style.width = `${perf}%`;
+                    }
+
+                    if (d.wifi !== undefined) {
+                        const icon = document.getElementById('wifiIcon');
+                        if (icon) {
+                            icon.innerHTML = d.wifi 
+                                ? '<i class="fas fa-wifi"></i>' 
+                                : '<i class="fas fa-wifi-slash"></i>';
+                        }
+                    }
+                }
+
+                // === INITIALIZATION ===
+                document.addEventListener('DOMContentLoaded', () => {
+                    connectWS();
+                    
+                    // Uptime timer
+                    setInterval(() => {
+                        const elapsed = Math.floor((Date.now() - window.startTime) / 1000);
+                        const h = Math.floor(elapsed / 3600);
+                        const m = Math.floor((elapsed % 3600) / 60);
+                        const s = elapsed % 60;
+                        const uptimeEl = document.getElementById('uptime');
+                        if (uptimeEl) uptimeEl.textContent = (h > 0 ? h + 'h ' : '') + m + 'm ' + s + 's';
+                    }, 1000);
+                    
+                    // IP display
+                    const ipEl = document.getElementById('ipAddr');
+                    if (ipEl) ipEl.textContent = location.hostname;
+                });
+
+                // === RESET BUTTON (let WebSocket handle display updates) ===
+                document.getElementById('resetBtn').onclick = async () => {
                     const btn = document.getElementById('resetBtn');
+                    const originalHtml = btn.innerHTML;
                     
                     btn.disabled = true;
                     btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Resetting...';
 
-                    document.getElementById('currentMeters').textContent = '0';
-                    document.getElementById('linearSpeed').textContent = '0.00';
-                    document.getElementById('totalRevs').textContent = '0';
-                    document.getElementById('rotSpeed').textContent = '0';
-                    document.getElementById('performance').textContent = '0.0';
-                    document.getElementById('perfBar').style.width = '0%';
-
-                    document.querySelectorAll('.step').forEach(s => s.classList.remove('active','completed'));
-                    document.getElementById('timelineProgress').style.width = '0%';
-                    document.getElementById('timeline').classList.remove('paused','interrupt');
-
-                    fetch('/sendCommand?token=' + encodeURIComponent(getToken()) + '&cmd=R', {method: 'GET'})
-                        .finally(() => {
-                            btn.disabled = false;
-                            btn.innerHTML = '<i class="fas fa-undo"></i> Reset';
+                    try {
+                        const response = await fetch('/sendCommand?token=' + encodeURIComponent(getToken()) + '&cmd=R', {
+                            method: 'GET',
+                            headers: { 'Cache-Control': 'no-cache' }
                         });
+                        if (!response.ok) {
+                            console.warn('⚠️ Reset failed:', response.status);
+                            alert('Reset command failed');
+                        }
+                    } catch (err) {
+                        console.error('❌ Reset error:', err);
+                        alert('Network error');
+                    } finally {
+                        setTimeout(() => {
+                            btn.disabled = false;
+                            btn.innerHTML = originalHtml;
+                        }, 2000);
+                    }
                 };
 
+                // === REBOOT BUTTON ===
                 document.getElementById('rebootBtn').onclick = () => {
                     if (confirm('Reboot the system now?')) {
-                        fetch('/reboot?token=' + encodeURIComponent(getToken()), {method: 'POST'});
-                        alert('Reboot command sent — page will refresh in ~15 seconds');
+                        fetch('/reboot?token=' + encodeURIComponent(getToken()), {method: 'POST'})
+                            .then(() => {
+                                alert('Reboot sent — page will refresh in ~15s');
+                                setTimeout(() => location.reload(), 15000);
+                            })
+                            .catch(err => {
+                                console.error('Reboot failed:', err);
+                                alert('Failed to send reboot');
+                            });
                     }
                 };
 
@@ -860,10 +938,6 @@ const char* serverIndex = R"rawliteral(
                     localStorage.clear();
                     location.href = '/';
                 }
-
-                window.onload = () => {
-                    document.getElementById('ipAddr').textContent = location.hostname;
-                };
             </script>
         </body>
     </html>
@@ -965,6 +1039,12 @@ const char* configPage = R"rawliteral(
                     margin-bottom: 0.6rem;
                     font-size: 0.98rem;
                     color: var(--text);
+                }
+                .hint {
+                    font-size: 0.85rem;
+                    color: var(--text-secondary);
+                    margin-top: 0.3rem;
+                    font-style: italic;
                 }
                 input {
                     width: 100%;
@@ -1107,7 +1187,11 @@ const char* configPage = R"rawliteral(
                                 <label for="machine_id"><i class="fas fa-hashtag"></i> Machine ID (0–255)</label>
                                 <input type="number" id="machine_id" value="%MACHINE_ID%" min="0" max="255" required>
                             </div>
-                            <!-- Add more fields if needed (static IP, lanes, distances, etc.) -->
+                            <div class="form-group">
+                                <label for="circumference"><i class="fas fa-ruler"></i> Drum Circumference (meters)</label>
+                                <input type="number" id="circumference" value="%CIRCUMFERENCE%" min="0.001" max="10.0" step="0.001" required>
+                                <div class="hint">Used to calculate RPM from linear speed. Default: 3.125 m</div>
+                            </div>
                             <button type="submit" class="primary"><i class="fas fa-save"></i> Save Configuration</button>
                         </form>
                     </div>
@@ -1158,8 +1242,8 @@ const char* configPage = R"rawliteral(
                     e.preventDefault();
                     const payload = {
                         api_url: document.getElementById('api_url').value.trim(),
-                        machine_id: parseInt(document.getElementById('machine_id').value)
-                        // Add other fields here if you have more
+                        machine_id: parseInt(document.getElementById('machine_id').value),
+                        circumference: parseFloat(document.getElementById('circumference').value)
                     };
 
                     try {
