@@ -29,7 +29,7 @@ String API_BASE_URL = "http://192.168.1.248:7272/DBLOG/";  // Default API URL
 uint8_t MACHINE_ID = 98;
 String host;
 String sessionToken = "";
-constexpr int endPointPowerupTime = 60000UL;
+constexpr int SwichPowerUpTime = 60000UL;
 unsigned long restartTime = 0;
 bool webServerStarted = false;
 bool updating = false;
@@ -72,9 +72,12 @@ struct MachineState {
   unsigned long powerfailTimestamp = 0;
   int beamLength = 1212;
   uint8_t windSection = 1;
+  float circumferance = 3.125;
+
   int currentMeters = 0;
   int drumRevs = 0;
-  float circumferance = 3.125;
+  float linearSpeed = 0.0f;
+  float angularSpeed = 0.0f;
 
   bool wifiSetupDone = false;
   bool triggerPortal = false;
@@ -104,38 +107,7 @@ struct PendingWebRequest {
   uint16_t revolutions = 0;
   unsigned long timestamp = 0;  // when it was queued
 };
-struct OurdissoireLive {
-  String machineState = "normal_stop";  // running / normal_stop / chain_stop
-  int currentMeters = 0;
-  float linearSpeed = 0.0f;
-  int drumRPM = 0;
-};
 
-OurdissoireLive liveData;
-OurdissoireLive lastLiveSent;
-struct DashboardData {
-  uint16_t revolutions = 0;
-  float performance = 0.0f;
-  int lastCodeStop = -1;
-  String lastCodeLabel = "";
-  bool wifiConnected = false;
-
-  bool changed(const DashboardData& other) const {
-    return revolutions != other.revolutions || abs(performance - other.performance) > 0.1f || lastCodeStop != other.lastCodeStop || lastCodeLabel != other.lastCodeLabel || wifiConnected != other.wifiConnected;
-  }
-};
-struct ScreenLastSent {
-  int8_t halt = -1;
-  uint16_t speed = 9999;  // impossible value
-  float perf = -1.0f;
-  int8_t wifi = -1;
-  uint8_t machine = 0;
-  // add others only if you send them to screen
-};
-DashboardData currentData;
-DashboardData lastSentData;
-uint16_t lastProductionStepCode = 0;
-String lastProductionStepLabel = "";
 unsigned long lastScreenSendTime = 0;
 const unsigned long MIN_SCREEN_SEND_INTERVAL = 20;
 
@@ -146,7 +118,7 @@ WebSocketsServer webSocket(81);
 Preferences preferences;
 HttpRequestState httpState;
 static RxState rxState = RxState::IDLE;
-ProductionStages currentStage = OURDISSAGE;
+ProductionStages currentStage = ENCANTRAGE;
 
 // USART instances
 HardwareSerial atmegaSerial(0);  // UART0 for ATmega328
@@ -166,23 +138,25 @@ void queueWebRequest(const char* operatorID, uint8_t machineID, int haltCode, in
 void handleWebRequest();
 // ======= local web page and local web server =========
 void handleWebServer();
-void broadcastMachineState();
-String processor(const String& var);
 String generateSessionToken();
 void resetMDNS();
 bool isAuthenticated();
-void sendDashboardUpdate();
+void sendDashboardUpdate(bool force);
 // ======= wifi provisionning =========================
 void setupWiFi();
+// ======= mescilinous functions ======================
+void scheduleRestart();
 void i2cScanner();
 bool isApiReachable();
 void syncState();
+
+// ====================================================
 
 void setup(void) {
   Serial.begin(115200);
   atmegaSerial.begin(38400, SERIAL_8N1, ESP32_RXD0, ESP32_TXD0);
   screenSerial.begin(115200, SERIAL_8N1, CYD_RXD, CYD_TXD);
-  // indicator LED for wifi connectivity
+
   pinMode(39, OUTPUT);
   digitalWrite(39, LOW);
 
@@ -215,7 +189,6 @@ void setup(void) {
     needsWrite = true;
   }
 
-  // Now safely read the values
   MACHINE_ID = preferences.getUChar("machine_id", 99);
   API_BASE_URL = preferences.getString("api_url", API_BASE_URL);
   sessionToken = preferences.getString("session_token", "");
@@ -249,7 +222,6 @@ void setup(void) {
       wm.autoConnect();  // will open portal only if connection fails
     }
   }
-  // Create FreeRTOS task (run on Core 1 - recommended)
   xTaskCreatePinnedToCore(serialTask, "SerialTask", 16384, NULL, 1, NULL, 1);
   vTaskDelay(200 / portTICK_PERIOD_MS);
 
@@ -266,7 +238,7 @@ void setup(void) {
     if (powerFailDetected) {
       Serial.printf(" Received 'F1' on attempt %d → Power fail confirmed!\n", attempt + 1);
       state.powerfailTimestamp = millis();
-      delay(endPointPowerupTime);  // delay only on real power fail
+      delay(SwichPowerUpTime);  // delay only on real power fail
     }
   }
   if (!powerFailDetected) {
@@ -275,51 +247,25 @@ void setup(void) {
   setupWiFi();
   Serial.printf("Loaded configuration - API URL: %s, Machine ID: %u, mDNS Hostname: %s.local\n", API_BASE_URL.c_str(), MACHINE_ID, host.c_str());
 
-  // setup websocket
+  // ==================== WEBSOCKET SETUP ====================
   webSocket.begin();
   webSocket.enableHeartbeat(30000, 3000, 2);
   webSocket.onEvent([](uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
       case WStype_CONNECTED:
-        Serial.printf(F("[WS] Client #%u connected → accepting EVERYONE (debug mode)\n"), num);
-        // Optional: you can also print the client's IP for better debugging
-        Serial.printf(F("[WS] Client #%u IP: %s\n"), num, webSocket.remoteIP(num).toString().c_str());
-
-        // Force full refresh by resetting last sent data
-        lastSentData = DashboardData{};  // This zeros/clears all fields
-        // Immediately send current dashboard state to the newly connected client
-        sendDashboardUpdate();
+        Serial.printf("[WS] ✅ Client #%u connected from %s\n", num, webSocket.remoteIP(num).toString().c_str());
+        sendDashboardUpdate(true);  // Send initial state
         break;
-
       case WStype_DISCONNECTED:
-        Serial.printf(F("[WS] Client #%u disconnected\n"), num);
+        Serial.printf("[WS] ❌ Client #%u disconnected\n", num);
         break;
       case WStype_TEXT:
-        // Optional: if you want to see what the client is sending
-        Serial.printf(F("[WS] Client #%u sent: %.*s\n"), num, length, payload);
-        // If you later implement client→server messages (commands, auth, etc.)
-        // you can process them here
-        break;
-
-      case WStype_BIN:
-        Serial.printf(F("[WS] Client #%u sent binary data (%u bytes)\n"), num, length);
-        break;
-
-      case WStype_ERROR:
-        Serial.printf(F("[WS] Client #%u error occurred!\n"), num);
-        break;
-
-      case WStype_FRAGMENT_TEXT_START:
-      case WStype_FRAGMENT_BIN_START:
-      case WStype_FRAGMENT:
-      case WStype_FRAGMENT_FIN:
-        // Fragmented messages - usually rare in simple dashboards
-        break;
-      default:
-        Serial.printf(F("[WS] Client #%u unknown event type: %d\n"), num, type);
+        Serial.printf("[WS] 📩 Client #%u: %.*s\n", num, (int)length, payload);
         break;
     }
   });
+
+
   if (MDNS.begin(host.c_str())) {
     Serial.printf(F("mDNS started: %s.local\n"), host.c_str());
     MDNS.addService("http", "tcp", 80);
@@ -334,9 +280,9 @@ void loop(void) {
   if (webServerStarted) {
     server.handleClient();  // This is mandatory!
   }
-  webSocket.loop();  // Important for WebSocketsServer
+  webSocket.loop();
   if (powerFailDetected && state.wifiConnected && isApiReachable() && !httpState.active) {
-    unsigned long downtime = (millis() - state.powerfailTimestamp + endPointPowerupTime) / 1000;
+    unsigned long downtime = (millis() - state.powerfailTimestamp + SwichPowerUpTime) / 1000;
     sendWebRequest("0", MACHINE_ID, 19, 0, downtime);
     powerFailDetected = false;
   }
@@ -469,9 +415,7 @@ void processScreenData(const char* data) {
   if (strcmp(cmd, "Stage") == 0 && valueStr) {
     uint8_t stageCode = (uint8_t)atoi(valueStr);
     state.stageCode = stageCode;
-    // Send to cloud
     sendWebRequest(opid ? opid : "0", MACHINE_ID, stageCode, 0, 0);
-    // Forward stage to ATmega
     sendCommand('P', state.stageCode);
 
     // === Handle Avancement when stage = OURDISSAGE (109) ===
@@ -483,7 +427,6 @@ void processScreenData(const char* data) {
       fetchMachineData();
       sendCommand('L', state.beamLength);
     }
-    // Update your stage enum if still used
     switch (stageCode) {
       case 103: currentStage = ENCANTRAGE; break;
       case 106: currentStage = ENCANTRAGE_PARTIEL; break;
@@ -494,14 +437,16 @@ void processScreenData(const char* data) {
       case 111: currentStage = ENSOUPLAGE; break;
       case 112: currentStage = FIN_ENSOUPLAGE; break;
     }
-    sendDashboardUpdate();
+    // need to update dashboard here;
+    sendDashboardUpdate(true);
   } else if (strcmp(cmd, "Circ") == 0 && valueStr != nullptr) {
     float circFloat = atof(valueStr);                         // "3.125"
     int32_t circScaled = (int32_t)round(circFloat * 1000.0);  // 3.125 → 3125
     Serial.printf("→ Circumference: %s → %.3f → sending C%d to ATmega\n", valueStr, circFloat, circScaled);
     sendCommand('C', circScaled);
     sendWebRequest(opid ? opid : "0", MACHINE_ID, 196, circScaled, 0);
-    sendDashboardUpdate();
+    // need to update dashboard here;
+    sendDashboardUpdate(true);
   } else if (strcmp(cmd, "Halt") == 0 && valueStr) {
     state.stopCode = atoi(valueStr);
     sendWebRequest(opid ? opid : "0", MACHINE_ID, state.stopCode, 0, 0);
@@ -512,7 +457,8 @@ void processScreenData(const char* data) {
     } else {
       state.onRepaire = false;
     }
-    sendDashboardUpdate();
+    // need to update dashboard here;
+    sendDashboardUpdate(true);
   } else if (strcmp(cmd, "machID") == 0 && valueStr) {
     int id = atoi(valueStr);
     if (id >= 0 && id <= 255) {
@@ -547,8 +493,24 @@ void handleAtmegaData() {
         powerFailDetected = true;
         sendCommand('P', state.stageCode);
         sendCommand('Y', state.windSection);
+        sendCommand('L', state.beamLength);
         Serial.println("Power fail forced!");
       } else if (prefix == 'R' || prefix == 'M' || prefix == 'S' || prefix == 'A') {
+        switch (prefix) {
+          case 'R':
+            state.drumRevs = value;
+            break;
+          case 'M':
+            state.currentMeters = value;
+            break;
+          case 'S':
+            state.linearSpeed = value / 100;
+            break;
+          case 'A':
+            state.angularSpeed = value / 100;
+            break;
+        }
+        sendDashboardUpdate(true);
         UpdateScreen(prefix, value);
       } else {
         processAtmegaCommand(commandBuffer);
@@ -574,6 +536,7 @@ void processAtmegaCommand(const char* cmd) {
       } else {
         state.stopCode = value;
         sendWebRequest("0", MACHINE_ID, state.stopCode, 0, 0);
+        sendDashboardUpdate(true);
       }
       Serial.printf("Stop code received: %d\n", value);
       break;
@@ -596,7 +559,8 @@ void processAtmegaCommand(const char* cmd) {
 
   // Now send to screen using the new signature
   UpdateScreen(prefix, value);
-  sendDashboardUpdate();
+  // need to update dashboard here;
+  sendDashboardUpdate(true);
 }
 void sendCommand(char cmd, int value) {
   atmegaSerial.print(cmd);
@@ -815,7 +779,8 @@ void handleWebRequest() {
           // === Send full initial state to CYD screen (only once) ===
           if (!state.initialStateLoaded) {
             syncState();
-            sendDashboardUpdate();
+            // need to update dashboard here;
+            sendDashboardUpdate(true);
             state.initialStateLoaded = true;
           }
         } else {
@@ -1007,6 +972,7 @@ void handleWebServer() {
     String page = configPage;
     page.replace("%API_URL%", API_BASE_URL);
     page.replace("%MACHINE_ID%", String(MACHINE_ID));
+    page.replace("%CIRCUMFERENCE%", String(state.circumferance, 3));
     server.send(200, "text/html", page);
   });
   server.on("/sendCommand", HTTP_GET, [requireAuth]() {
@@ -1014,22 +980,14 @@ void handleWebServer() {
 
     String cmd = server.arg("cmd");
 
-    if (cmd == "R" || cmd == "r") {  // Accept R or r
-      // Clear live data on ESP32 side
-      liveData.currentMeters = 0;
-      liveData.linearSpeed = 0.0f;
-      liveData.drumRPM = 0;
-      liveData.machineState = "normal_stop";
-
-      // Force immediate dashboard update
-      lastLiveSent = {};  // invalidate comparison
-      sendDashboardUpdate();
-      // updateScreen('H', 0);
+    if (cmd == "R" || cmd == "r") {
+      state.beamLength = 0;
+      state.drumRevs = 0;
+      state.performance = 0.0;
       UpdateScreen('M', 0);
-      // Send reset command to ATmega with explicit newline
       sendCommand('R', 1);
       Serial.println(">>> WEB RESET: Sent 'R\\n' to ATmega");
-
+      sendDashboardUpdate(true);
       server.send(200, "text/plain", "OK: Reset sent");
     } else {
       server.send(400, "text/plain", "Invalid command");
@@ -1089,6 +1047,20 @@ void handleWebServer() {
       }
       preferences.end();
 
+      if (doc.containsKey("circumference")) {
+        float circ = doc["circumference"].as<float>();
+        if (circ > 0.0 && circ <= 50.0) {
+          state.circumferance = circ;
+          int32_t circScaled = (int32_t)round(circ * 1000.0);  // 3.125 → 3125
+          sendCommand('C', circScaled);
+          sendWebRequest("0", MACHINE_ID, 196, circScaled, 0);
+          Serial.printf("Updated circumference to %.3f m\n", circ);
+        } else {
+          preferences.end();
+          server.send(400, "text/plain", "Circumference must be 0.001–10.0 meters");
+          return;
+        }
+      }
       // Apply mDNS change if needed
       if (mdnsChanged) {
         resetMDNS();
@@ -1182,22 +1154,6 @@ void handleWebServer() {
   server.begin();
   Serial.println("Web server started");
 }
-void broadcastMachineState() {
-  StaticJsonDocument<512> doc;
-
-  doc["haltCode"] = state.stopCode;
-  doc["prodStep"] = state.stageCode;
-  doc["performance"] = state.performance;
-  doc["currentMeters"] = state.currentMeters;
-  doc["drumRPM"] = state.drumRevs;
-  doc["linearSpeed"] = 0.0;  // calculate if you have speed
-  doc["wifi"] = state.wifiConnected;
-  // Add LastCodeLabel if you store it
-
-  String json;
-  serializeJson(doc, json);
-  webSocket.broadcastTXT(json);
-}
 String generateSessionToken() {
   String token = "";
   const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -1232,41 +1188,42 @@ void resetMDNS() {
     MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
   }
 }
-// ==================== IMPROVED DASHBOARD SYNCHRONIZATION ====================
-void sendDashboardUpdate() {
+
+// ==================== WEBSOCKET DASHBOARD UPDATE (immediate) ====================
+void sendDashboardUpdate(bool force = false) {
   StaticJsonDocument<512> doc;
 
-  // === Main Machine Status ===
-  doc["haltCode"] = state.stopCode;
-  doc["prodStep"] = state.stageCode;  // used as prodStep in JS
+  // Values expected by serverIndex JavaScript
+  doc["stopCode"] = state.stopCode;
+  doc["prodStep"] = state.stageCode;
+  doc["circumference"] = state.circumferance;
 
-  // Labels for better display
-  doc["LastCodeLabel"] = (state.stopCode == 100) ? "RUNNING" : "ARRÊT";
-  doc["productionStepLabel"] = getStageLabel(state.stageCode);
 
-  // Core metrics
+  // Status text for the big bar
+  if (state.stopCode == 100) {
+    doc["LastCodeLabel"] = "EN MARCHE";
+  } else {
+    doc["LastCodeLabel"] = "";  // Let JavaScript handle the label mapping
+  }
+
+  // Metrics
   doc["performance"] = roundf(state.performance * 10.0f) / 10.0f;
-  doc["currentMeters"] = state.beamLength;  // most logical field for "Total Beam Length"
-  doc["windSection"] = state.windSection;
+  doc["currentMeters"] = state.currentMeters;
+  doc["drumRPM"] = state.drumRevs;
+  doc["linearSpeed"] = state.linearSpeed;
+  doc["angularSpeed"] = state.angularSpeed;
 
-  // WiFi status
+
   doc["wifi"] = state.wifiConnected;
-
-  // Live data from ATmega (update these when you receive data from sensors)
-  doc["linearSpeed"] = liveData.linearSpeed;  // will be 0 until you fill it
-  doc["drumRPM"] = liveData.drumRPM;
-  doc["totalRevs"] = state.drumRevs;  // if you track it
-
-  // Extra flags
-  doc["onRepaire"] = state.onRepaire;
-  doc["updating"] = updating;
 
   String jsonStr;
   serializeJson(doc, jsonStr);
 
   webSocket.broadcastTXT(jsonStr);
 
-  Serial.printf("[WS] Broadcast → halt:%d | stage:%d | perf:%.1f | beam:%d | wifi:%d\n", state.stopCode, state.stageCode, state.performance, state.beamLength, state.wifiConnected);
+  if (force) {
+    Serial.printf("[WS] Immediate update → stop:%d stage:%d perf:%.1f beam:%d\n", state.stopCode, state.stageCode, state.performance, state.beamLength);
+  }
 }
 
 // ========= mescelineouce functions ======================
