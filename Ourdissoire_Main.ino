@@ -65,7 +65,6 @@ struct MachineState {
   float performance = 0.0;
   bool onRepaire = true;
   bool wifiConnected = true;
-  bool resumeHaltCode = false;
   uint8_t stopCode = 100;
   uint8_t previousStopCode = 0;
   uint8_t stageCode = 0;
@@ -73,12 +72,10 @@ struct MachineState {
   int beamLength = 1212;
   uint8_t windSection = 1;
   float circumferance = 3.125;
-
   int currentMeters = 0;
   int drumRevs = 0;
   float linearSpeed = 0.0f;
   float angularSpeed = 0.0f;
-
   bool wifiSetupDone = false;
   bool triggerPortal = false;
   bool initialStateLoaded = false;
@@ -95,6 +92,7 @@ struct HttpRequestState {
   unsigned long lastFetchTime = 0;
 
   HTTPClient* http = nullptr;
+  // HTTPClient http;
   String jsonPayload;
   char url[128] = { 0 };
 };
@@ -107,6 +105,28 @@ struct PendingWebRequest {
   uint16_t revolutions = 0;
   unsigned long timestamp = 0;  // when it was queued
 };
+
+// ===== WiFi Reconnection State =====
+enum class WiFiReconnectState {
+  CONNECTED,
+  DISCONNECTED,
+  RECONNECTING,
+  PORTAL_REQUESTED
+};
+
+struct WiFiReconnectConfig {
+  unsigned long reconnectDelay = 1000;
+  unsigned long maxReconnectDelay = 30000;
+  unsigned long lastReconnectAttempt = 0;
+  uint8_t reconnectAttempts = 0;
+  const uint8_t maxAttemptsBeforeReset = 10;
+  WiFiReconnectState state = WiFiReconnectState::DISCONNECTED;  // Start disconnected
+};
+
+WiFiReconnectConfig wifiReconnect;
+unsigned long lastSuccessfulConnect = 0;
+const unsigned long MAX_DISCONNECT_TIME = 120000;  // 2 min before forced reset
+bool portalRequested = false;                      // ← Flag for screen "Portal" command
 
 unsigned long lastScreenSendTime = 0;
 const unsigned long MIN_SCREEN_SEND_INTERVAL = 20;
@@ -132,9 +152,9 @@ void processAtmegaCommand(const char* cmd);
 void sendCommand(char cmd, int value);
 void UpdateScreen(char prefix, int value);
 // ====== interface web server ========================
-void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions);
+void sendWebRequest(const char* operatorID, int haltCode, int16_t value);
 void fetchMachineData();
-void queueWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions);
+void queueWebRequest(const char* operatorID, int haltCode, int16_t valeur);
 void handleWebRequest();
 // ======= local web page and local web server =========
 void handleWebServer();
@@ -168,83 +188,92 @@ void setup(void) {
   i2cScanner();
 
   // === Load / Initialize configuration from Preferences ===
-  preferences.begin("app-config", false);  // false = read/write mode (required for writing)
-  bool needsWrite = false;
-  if (!preferences.isKey("machine_id")) {
-    MACHINE_ID = 98;
-    preferences.putUChar("machine_id", MACHINE_ID);
-    Serial.println("NVS was empty → set default Machine ID = 99");
-    needsWrite = true;
-  }
-  if (!preferences.isKey("api_url") || preferences.getString("api_url").length() == 0) {
-    API_BASE_URL = "http://192.168.1.248:7272/DBLOG/";
-    preferences.putString("api_url", API_BASE_URL);
-    Serial.println("NVS was empty → set default API URL");
-    needsWrite = true;
-  }
-  if (!preferences.isKey("session_token") || preferences.getString("session_token").length() == 0) {
-    sessionToken = "";
-    preferences.putString("session_token", sessionToken);
-    Serial.println("NVS was empty → cleared session token");
-    needsWrite = true;
-  }
-
-  MACHINE_ID = preferences.getUChar("machine_id", 99);
-  API_BASE_URL = preferences.getString("api_url", API_BASE_URL);
-  sessionToken = preferences.getString("session_token", "");
-
-  preferences.end();
-
-  host = "machine" + String(MACHINE_ID);
   {
-    // === WiFi Setup with clean logic ===
-    Serial.println("Starting WiFi setup...");
-
-    if (!wm.getWiFiIsSaved()) {
-      Serial.println("No saved WiFi credentials → setting factory defaults and opening portal");
-
-      String defaultSSID = "Machine" + String(MACHINE_ID);
-      String defaultPass = "hikma1234";
-
-      // Force save default credentials
-      wm.setConfigPortalTimeout(180);
-      bool saved = wm.autoConnect(defaultSSID.c_str(), defaultPass.c_str());
-
-      if (saved) {
-        Serial.println("Default credentials saved and connected");
-      } else {
-        Serial.println("Failed to save default credentials");
-      }
-    } else {
-      Serial.println("WiFi credentials already saved in storage → trying to connect");
-      wm.setConfigPortalTimeout(0);  // don't open portal on first try
-      wm.setConnectTimeout(15);
-      wm.autoConnect();  // will open portal only if connection fails
+    preferences.begin("app-config", false);  // false = read/write mode (required for writing)
+    bool needsWrite = false;
+    if (!preferences.isKey("machine_id")) {
+      MACHINE_ID = 98;
+      preferences.putUChar("machine_id", MACHINE_ID);
+      Serial.println("NVS was empty → set default Machine ID = 99");
+      needsWrite = true;
     }
+    if (!preferences.isKey("api_url") || preferences.getString("api_url").length() == 0) {
+      API_BASE_URL = "http://192.168.1.248:7272/DBLOG/";
+      preferences.putString("api_url", API_BASE_URL);
+      Serial.println("NVS was empty → set default API URL");
+      needsWrite = true;
+    }
+    if (!preferences.isKey("session_token") || preferences.getString("session_token").length() == 0) {
+      sessionToken = "";
+      preferences.putString("session_token", sessionToken);
+      Serial.println("NVS was empty → cleared session token");
+      needsWrite = true;
+    }
+
+    MACHINE_ID = preferences.getUChar("machine_id", 99);
+    API_BASE_URL = preferences.getString("api_url", API_BASE_URL);
+    sessionToken = preferences.getString("session_token", "");
+    preferences.end();
   }
+  // create tasks for serial
   xTaskCreatePinnedToCore(serialTask, "SerialTask", 16384, NULL, 1, NULL, 1);
   vTaskDelay(200 / portTICK_PERIOD_MS);
+  // check if there is a real power failure
+  {
+    for (int attempt = 0; attempt < 3 && !powerFailDetected; attempt++) {
+      atmegaSerial.println("S1");
+      Serial.printf(" Sent 'S1' to ATmega (attempt %d)\n", attempt + 1);
 
-  for (int attempt = 0; attempt < 3 && !powerFailDetected; attempt++) {
-    atmegaSerial.println("S1");
-    Serial.printf(" Sent 'S1' to ATmega (attempt %d)\n", attempt + 1);
+      unsigned long timeout = millis() + 800;
+      while (millis() < timeout && !powerFailDetected) {
+        handleAtmegaData();                  // ← Process UART buffer FIRST
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // ← Then yield (1ms is enough)
+      }
 
-    unsigned long timeout = millis() + 800;
-    while (millis() < timeout && !powerFailDetected) {
-      handleAtmegaData();                  // ← Process UART buffer FIRST
-      vTaskDelay(1 / portTICK_PERIOD_MS);  // ← Then yield (1ms is enough)
+      if (powerFailDetected) {
+        Serial.printf(" Received 'F1' on attempt %d → Power fail confirmed!\n", attempt + 1);
+        state.powerfailTimestamp = millis();
+        delay(SwichPowerUpTime);  // delay only on real power fail
+      }
     }
-
-    if (powerFailDetected) {
-      Serial.printf(" Received 'F1' on attempt %d → Power fail confirmed!\n", attempt + 1);
-      state.powerfailTimestamp = millis();
-      delay(SwichPowerUpTime);  // delay only on real power fail
+    if (!powerFailDetected) {
+      Serial.printf(" No F1 after 3 attempts → warm restart (no power fail)\n", millis() / 1000.0);
     }
   }
-  if (!powerFailDetected) {
-    Serial.printf(" No F1 after 3 attempts → warm restart (no power fail)\n", millis() / 1000.0);
+  // check if there are an saved wifi credentials and attempt to reconnect
+  {
+    host = "machine" + String(MACHINE_ID);
+
+    // === 🔑 CRITICAL: Register WiFi event handler BEFORE any WiFi calls ===
+    WiFi.onEvent(WiFiEvent);
+    WiFi.setAutoReconnect(false);  // We handle reconnection manually
+    WiFi.setSleep(false);          // Disable sleep for industrial reliability
+    WiFi.setHostname(host.c_str());
+
+    // === Your exact flow: Check credentials → portal or connect ===
+    String apName = "Machine" + String(MACHINE_ID);
+    String apPass = "Nsight1234";
+
+    // Configure WiFiManager ONCE here
+    wm.setConfigPortalTimeout(180);
+    wm.setConnectTimeout(20);
+    wm.setConnectRetries(3);
+    wm.setCleanConnect(true);
+    wm.setBreakAfterConfig(true);
+    wm.setShowInfoErase(false);
+    wm.setShowInfoUpdate(false);
+
+    if (!wm.getWiFiIsSaved()) {
+      // NO saved credentials → open portal with your hostname
+      Serial.println(F("[Setup] No saved credentials → opening config portal"));
+      wm.setConfigPortalBlocking(true);  // Block until configured
+      wm.startConfigPortal(apName.c_str(), apPass.c_str());
+      // After portal: credentials saved, continue to connect
+    }
+    setupWiFi();
   }
-  setupWiFi();
+
+  Serial.printf(F("✅ Setup complete - Host: %s.local | WiFi: %s\n"), host.c_str(), state.wifiConnected ? "CONNECTED" : "DISCONNECTED");
   Serial.printf("Loaded configuration - API URL: %s, Machine ID: %u, mDNS Hostname: %s.local\n", API_BASE_URL.c_str(), MACHINE_ID, host.c_str());
 
   // ==================== WEBSOCKET SETUP ====================
@@ -265,7 +294,6 @@ void setup(void) {
     }
   });
 
-
   if (MDNS.begin(host.c_str())) {
     Serial.printf(F("mDNS started: %s.local\n"), host.c_str());
     MDNS.addService("http", "tcp", 80);
@@ -283,15 +311,21 @@ void loop(void) {
   webSocket.loop();
   if (powerFailDetected && state.wifiConnected && isApiReachable() && !httpState.active) {
     unsigned long downtime = (millis() - state.powerfailTimestamp + SwichPowerUpTime) / 1000;
-    sendWebRequest("0", MACHINE_ID, 19, 0, downtime);
+    sendWebRequest("0", 19, downtime);
     powerFailDetected = false;
   }
+  handleWiFiReconnection();
   static unsigned long lastLog = 0;
   if (millis() - lastLog >= 60000) {
-    if (WiFi.status() != WL_CONNECTED || !isApiReachable()) {
-      Serial.printf(F("Stale WiFi detected (API unreachable)! RSSI: %d dBm, IP: %s. Forcing reconnect...\n"), WiFi.RSSI(), WiFi.localIP().toString().c_str());
-      setupWiFi();
+
+    if (state.wifiConnected && !httpState.active) {
+      if (!isApiReachable()) {
+        Serial.println(F("⚠️ API unreachable - WiFi recovery will handle"));
+        Serial.println(F("[Monitor] API unreachable → marking for reconnection"));
+        Serial.printf(F("Stale WiFi detected (API unreachable)! RSSI: %d dBm, IP: %s.\n"), WiFi.RSSI(), WiFi.localIP().toString().c_str());
+      }
     }
+
     fetchMachineData();
 
     uint32_t totalHeap = ESP.getHeapSize();
@@ -415,7 +449,7 @@ void processScreenData(const char* data) {
   if (strcmp(cmd, "Stage") == 0 && valueStr) {
     uint8_t stageCode = (uint8_t)atoi(valueStr);
     state.stageCode = stageCode;
-    sendWebRequest(opid ? opid : "0", MACHINE_ID, stageCode, 0, 0);
+    sendWebRequest(opid ? opid : "0", stageCode, 0);
     sendCommand('P', state.stageCode);
 
     // === Handle Avancement when stage = OURDISSAGE (109) ===
@@ -424,6 +458,7 @@ void processScreenData(const char* data) {
       int32_t avScaled = (int32_t)round(avFloat * 1000.0);  // 2.000 → 2000
       Serial.printf("→ Avancement: %s → %.3f → sending A%d to ATmega\n", avStr, avFloat, avScaled);
       sendCommand('A', avScaled);
+      sendWebRequest(opid ? opid : "0", 197, avScaled);
       fetchMachineData();
       sendCommand('L', state.beamLength);
     }
@@ -444,12 +479,12 @@ void processScreenData(const char* data) {
     int32_t circScaled = (int32_t)round(circFloat * 1000.0);  // 3.125 → 3125
     Serial.printf("→ Circumference: %s → %.3f → sending C%d to ATmega\n", valueStr, circFloat, circScaled);
     sendCommand('C', circScaled);
-    sendWebRequest(opid ? opid : "0", MACHINE_ID, 196, circScaled, 0);
+    sendWebRequest(opid ? opid : "0", 196, circScaled);
     // need to update dashboard here;
     sendDashboardUpdate(true);
   } else if (strcmp(cmd, "Halt") == 0 && valueStr) {
     state.stopCode = atoi(valueStr);
-    sendWebRequest(opid ? opid : "0", MACHINE_ID, state.stopCode, 0, 0);
+    sendWebRequest(opid ? opid : "0", state.stopCode, 0);
 
     if (state.stopCode == 146 || state.stopCode == 147 || state.stopCode == 115) {
       state.onRepaire = true;
@@ -473,8 +508,10 @@ void processScreenData(const char* data) {
     fetchMachineData();
     syncState();
   } else if (strcmp(cmd, "Portal") == 0) {
-    // Refresh screen with current values
-    Serial.println("open wifi provesioning portal of wifi manager");
+    Serial.println(F("[Screen] 🚪 Portal command received → opening config portal"));
+    portalRequested = true;  // ← Set flag, don't block loop
+    wifiReconnect.state = WiFiReconnectState::PORTAL_REQUESTED;
+    UpdateScreen('X', 0);
   }
 }
 
@@ -535,18 +572,18 @@ void processAtmegaCommand(const char* cmd) {
       if (state.onRepaire) {
       } else {
         state.stopCode = value;
-        sendWebRequest("0", MACHINE_ID, state.stopCode, 0, 0);
+        sendWebRequest("0", state.stopCode, 0);
         sendDashboardUpdate(true);
       }
       Serial.printf("Stop code received: %d\n", value);
       break;
     case 'L':
-      sendWebRequest("0", MACHINE_ID, 194 /*94*/, value, 0);
+      sendWebRequest("0", 120, value);
       Serial.printf("chunk Length per minute %d\n", value);
       break;
     case 'Y':
       state.windSection = value;
-      sendWebRequest("0", MACHINE_ID, 195, state.windSection, 0);
+      sendWebRequest("0", 195, state.windSection);
       break;
     case 'D':
       syncState();
@@ -636,16 +673,17 @@ void sendScreenCommand() {
 }
 
 //========== Handle server and coude data exchange =========
-void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions) {
+void sendWebRequest(const char* operatorID, int haltCode, int16_t value) {
   if (!state.wifiConnected || !isApiReachable()) {
     Serial.println(F("WiFi not connected → queuing request"));
-    queueWebRequest(operatorID, machineID, haltCode, position, revolutions);
+    queueWebRequest(operatorID, haltCode, value);
+    setupWiFi();
     return;
   }
 
   if (httpState.active) {
     Serial.println(F("HTTP busy → queuing request"));
-    queueWebRequest(operatorID, machineID, haltCode, position, revolutions);
+    queueWebRequest(operatorID, haltCode, value);
     return;
   }
 
@@ -661,11 +699,10 @@ void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int
 
   // snprintf(httpState.url, sizeof(httpState.url), "%sRecording_Events_Api.php", API_BASE_URL.c_str());
   String baseUrl = useMockoon ? MOCKOON_BASE_URL : API_BASE_URL;
-
-  if (httpState.isFetchMachineData) {
-    snprintf(httpState.url, sizeof(httpState.url), "%sgetMachineData", baseUrl.c_str());
+  if (useMockoon) {
+    snprintf(httpState.url, sizeof(httpState.url), "%sPostMachineData", baseUrl.c_str());
   } else {
-    snprintf(httpState.url, sizeof(httpState.url), "%sPostMachineData", baseUrl.c_str());  // or whatever your real endpoint path is
+    snprintf(httpState.url, sizeof(httpState.url), "%sRecording_Events_Api.php", baseUrl.c_str());
   }
 
   httpState.http->setTimeout(httpState.HTTP_TIMEOUT_MS);
@@ -677,11 +714,9 @@ void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int
 
   StaticJsonDocument<300> doc;
   doc["idOperator"] = operatorID ? operatorID : "0";
-  doc["idMachine"] = machineID;
+  doc["idMachine"] = MACHINE_ID;
   doc["codeStop"] = haltCode;
-  doc["idDevice"] = machineID;
-  doc["reposition"] = position;
-  doc["revolution"] = revolutions;
+  doc["Valeur"] = value;
   doc["iPAddress"] = WiFi.localIP().toString();
 
   httpState.jsonPayload.clear();
@@ -694,6 +729,7 @@ void sendWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int
 void fetchMachineData() {
   if (!state.wifiConnected || !isApiReachable()) {
     Serial.println(F("WiFi not connected → skipping fetch"));
+    setupWiFi();
     return;
   }
   if (millis() - httpState.lastFetchTime < 5000) {
@@ -717,11 +753,10 @@ void fetchMachineData() {
   // snprintf(httpState.url, sizeof(httpState.url), "%sGet_Speed_and_Perfommence.php", API_BASE_URL.c_str());
 
   String baseUrl = useMockoon ? MOCKOON_BASE_URL : API_BASE_URL;
-
-  if (httpState.isFetchMachineData) {
+  if (useMockoon) {
     snprintf(httpState.url, sizeof(httpState.url), "%sgetMachineData", baseUrl.c_str());
   } else {
-    snprintf(httpState.url, sizeof(httpState.url), "%sPostMachineData", baseUrl.c_str());  // or whatever your real endpoint path is
+    snprintf(httpState.url, sizeof(httpState.url), "%sGet_Speed_and_Perfommence.php", baseUrl.c_str());
   }
 
   httpState.http->setTimeout(httpState.HTTP_TIMEOUT_MS);
@@ -801,11 +836,9 @@ void handleWebRequest() {
     }
   }
 
-  // Cleanup
   if (httpState.http) {
-    httpState.http->end();
-    delete httpState.http;
-    httpState.http = nullptr;
+    httpState.http->end();  // Release connection, keep object alive
+    // DO NOT: delete httpState.http;  ← This causes crashes on reuse
   }
 
   httpState.active = false;
@@ -836,7 +869,7 @@ void handleWebRequest() {
     handleWebRequest();  // recursive call to process the next one (safe because active=false now)
   }
 }
-void queueWebRequest(const char* operatorID, uint8_t machineID, int haltCode, int16_t position, uint16_t revolutions) {
+void queueWebRequest(const char* operatorID, int haltCode, int16_t value) {
   if (pendingWebRequests.size() >= 20) {
     pendingWebRequests.pop();
     Serial.println(F("Request queue full - dropped oldest"));
@@ -844,11 +877,9 @@ void queueWebRequest(const char* operatorID, uint8_t machineID, int haltCode, in
 
   StaticJsonDocument<300> doc;
   doc["idOperator"] = operatorID ? operatorID : "0";
-  doc["idMachine"] = machineID;
+  doc["idMachine"] = MACHINE_ID;
   doc["codeStop"] = haltCode;
-  doc["idDevice"] = machineID;
-  doc["reposition"] = position;
-  doc["revolution"] = revolutions;
+  doc["Valeur"] = value;
   doc["iPAddress"] = WiFi.localIP().toString();  // even if WiFi is down, we can store "0.0.0.0" or skip
 
   String jsonStr;
@@ -858,8 +889,12 @@ void queueWebRequest(const char* operatorID, uint8_t machineID, int haltCode, in
   Serial.printf(F("Request queued | Queue size: %d | HaltCode: %d\n"), pendingWebRequests.size(), haltCode);
 }
 
-// ========== Wifi provisionning =========================
+// ========== WiFi  Event Handler && WIFI provisionning ============
 void setupWiFi() {
+  static bool wifiSetupInProgress = false;
+  if (wifiSetupInProgress) return;
+  wifiSetupInProgress = true;
+
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
@@ -881,33 +916,162 @@ void setupWiFi() {
   wm.setShowInfoUpdate(false);
   wm.setCleanConnect(true);
 
-  bool connected = false;
-
-  if (wm.getWiFiIsSaved()) {
-    Serial.println(F("Saved WiFi credentials found → trying to connect..."));
-    wm.setConfigPortalTimeout(0);  // Do not open portal during first try
-    connected = wm.autoConnect(apName.c_str(), apPass.c_str());
-  } else {
-    Serial.println(F("No saved credentials → opening config portal"));
-    connected = wm.startConfigPortal(apName.c_str(), apPass.c_str());
-  }
-
+  bool connected = wm.autoConnect();
   if (connected) {
-    Serial.printf(F("✅ WiFi Connected! IP: %s\n"), WiFi.localIP().toString().c_str());
-    state.wifiConnected = true;
-    digitalWrite(39, HIGH);
-    UpdateScreen('X', 1);
-    resetMDNS();
-    handleWebServer();
-    fetchMachineData();
-    state.initialStateLoaded = false;
+    Serial.printf(F("[WiFi] ✅ Connected! IP: %s | RSSI: %d\n"), WiFi.localIP().toString().c_str(), WiFi.RSSI());
   } else {
-    Serial.println("❌ WiFi connection failed or portal timed out");
+    Serial.println(F("[WiFi] ⏳ Connecting in background (event-driven)..."));
     state.wifiConnected = false;
     UpdateScreen('X', 0);
   }
 
+  wifiSetupInProgress = false;
   state.wifiSetupDone = true;
+}
+void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println(F("[WiFi] ✅ Connected to AP"));
+      wifiReconnect.state = WiFiReconnectState::CONNECTED;
+      wifiReconnect.reconnectAttempts = 0;
+      wifiReconnect.reconnectDelay = 1000;
+      lastSuccessfulConnect = millis();
+      state.wifiConnected = true;
+      digitalWrite(39, HIGH);
+      UpdateScreen('X', 1);
+
+      // Re-init services after stable connection
+      vTaskDelay(300 / portTICK_PERIOD_MS);
+      resetMDNS();
+      if (!webServerStarted) handleWebServer();
+      fetchMachineData();
+      state.initialStateLoaded = false;
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      {
+        // ✅ FIX: Cast uint8_t to wifi_err_reason_t explicitly
+        wifi_err_reason_t reason = static_cast<wifi_err_reason_t>(info.wifi_sta_disconnected.reason);
+
+        Serial.printf(F("[WiFi] ❌ Disconnected. Reason: %d (%s)\n"),
+                      static_cast<int>(reason),
+                      WiFi.disconnectReasonName(reason));
+
+        state.wifiConnected = false;
+        digitalWrite(39, LOW);
+        UpdateScreen('X', 0);
+
+        if (wifiReconnect.state != WiFiReconnectState::RECONNECTING && wifiReconnect.state != WiFiReconnectState::PORTAL_REQUESTED) {
+          wifiReconnect.state = WiFiReconnectState::DISCONNECTED;
+          wifiReconnect.lastReconnectAttempt = millis();
+        }
+        break;
+      }
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf(F("[WiFi] 🎯 Got IP: %s\n"), WiFi.localIP().toString().c_str());
+      lastSuccessfulConnect = millis();
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      Serial.println(F("[WiFi] ⚠️ Lost IP address"));
+      state.wifiConnected = false;
+      break;
+
+    default: Serial.printf(F("[WiFi] Unhandled event: %d\n"), event); break;
+  }
+}
+void handleWiFiReconnection() {
+  // === Handle screen-triggered portal request ===
+  if (portalRequested || wifiReconnect.state == WiFiReconnectState::PORTAL_REQUESTED) {
+    Serial.println(F("[WiFi] 🚪 Opening config portal (screen request)..."));
+
+    // Stop current WiFi to avoid conflicts
+    WiFi.disconnect(true);
+    delay(200);
+
+    String apName = "Machine" + String(MACHINE_ID);
+    String apPass = "Nsight1234";
+
+    // Open portal NON-BLOCKING (so loop can continue)
+    wm.setConfigPortalTimeout(180);  // Auto-close after 3 min
+    wm.startConfigPortal(apName.c_str(), apPass.c_str());
+
+    // Reset flags
+    portalRequested = false;
+    wifiReconnect.state = WiFiReconnectState::DISCONNECTED;
+    wifiReconnect.lastReconnectAttempt = millis();
+
+    // After portal: try to reconnect with new creds
+    setupWiFi();
+    return;
+  }
+  // === If connected, just monitor ===
+  if (wifiReconnect.state == WiFiReconnectState::CONNECTED) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println(F("[WiFi] 🔄 Silent disconnect detected"));
+      wifiReconnect.state = WiFiReconnectState::DISCONNECTED;
+      wifiReconnect.lastReconnectAttempt = millis();
+    }
+    return;
+  }
+  // === Handle reconnection with exponential backoff ===
+  if (wifiReconnect.state == WiFiReconnectState::DISCONNECTED) {
+    unsigned long now = millis();
+
+    // Wait for backoff delay
+    if (now - wifiReconnect.lastReconnectAttempt >= wifiReconnect.reconnectDelay) {
+      Serial.printf(F("[WiFi] 🔄 Reconnect attempt %d/%d (delay: %lus)\n"),
+                    wifiReconnect.reconnectAttempts + 1,
+                    wifiReconnect.maxAttemptsBeforeReset,
+                    wifiReconnect.reconnectDelay / 1000);
+
+      wifiReconnect.state = WiFiReconnectState::RECONNECTING;
+      wifiReconnect.lastReconnectAttempt = now;
+
+      // ESP32-S3: Clean WiFi driver before reconnect
+      WiFi.scanDelete();
+      esp_wifi_stop();
+      delay(50);
+      esp_wifi_start();
+
+      // Try reconnect (NON-BLOCKING, no portal)
+      wm.setConfigPortalTimeout(0);
+      wm.autoConnect();  // Event handler will update state
+    }
+    return;
+  }
+  // === Check if reconnection succeeded/failed ===
+  if (wifiReconnect.state == WiFiReconnectState::RECONNECTING) {
+    if (millis() - wifiReconnect.lastReconnectAttempt > 10000) {  // 10s timeout
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println(F("[WiFi] ✅ Reconnection successful"));
+        wifiReconnect.state = WiFiReconnectState::CONNECTED;
+        wifiReconnect.reconnectAttempts = 0;
+        wifiReconnect.reconnectDelay = 1000;
+      } else {
+        Serial.println(F("[WiFi] ❌ Reconnection failed"));
+        wifiReconnect.state = WiFiReconnectState::DISCONNECTED;
+
+        // Exponential backoff
+        wifiReconnect.reconnectDelay = min(
+          wifiReconnect.reconnectDelay * 2,
+          wifiReconnect.maxReconnectDelay);
+        wifiReconnect.reconnectAttempts++;
+
+        // Force reset after too many failures
+        if (wifiReconnect.reconnectAttempts >= wifiReconnect.maxAttemptsBeforeReset) {
+          Serial.println(F("[WiFi] ⚠️ Too many failures → scheduling reset"));
+          restartTime = millis() + 5000;
+        }
+      }
+    }
+    return;
+  }
+  // === Safety: Reset if disconnected too long ===
+  if (!state.wifiConnected && lastSuccessfulConnect > 0 && millis() - lastSuccessfulConnect > MAX_DISCONNECT_TIME) {
+    Serial.println(F("[WiFi] ⚠️ Disconnected >2min → forcing reset"));
+    restartTime = millis() + 2000;
+  }
 }
 
 //=========== Webserver functions =========================
@@ -1053,7 +1217,7 @@ void handleWebServer() {
           state.circumferance = circ;
           int32_t circScaled = (int32_t)round(circ * 1000.0);  // 3.125 → 3125
           sendCommand('C', circScaled);
-          sendWebRequest("0", MACHINE_ID, 196, circScaled, 0);
+          sendWebRequest("0", 196, circScaled);
           Serial.printf("Updated circumference to %.3f m\n", circ);
         } else {
           preferences.end();
@@ -1254,42 +1418,128 @@ void i2cScanner() {
   Serial.println("Scan finished.\n");
 }
 bool isApiReachable() {
-  WiFiClient client;
-  // Parse host/port (your code already has this)
-  String url = API_BASE_URL;
-  url.toLowerCase();
-  int schemeEnd = url.indexOf("://");
-  if (schemeEnd == -1) return false;
-  String hostPart = url.substring(schemeEnd + 3);
-  int pathStart = hostPart.indexOf('/');
-  if (pathStart != -1) hostPart = hostPart.substring(0, pathStart);
-  int portStart = hostPart.indexOf(':');
-  String host = (portStart != -1) ? hostPart.substring(0, portStart) : hostPart;
-  int port = (portStart != -1) ? hostPart.substring(portStart + 1).toInt() : 80;  // HTTP, not HTTPS
+  // === Quick fail: WiFi not connected ===
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
 
-  client.setTimeout(3000);  // 3s timeout
-  // Serial.printf(F(" Testing reachability: %s:%d\n"), host.c_str(), port);
-  if (client.connect(host.c_str(), port)) {
+  // === Parse API_BASE_URL to extract host and port ===
+  String url = API_BASE_URL;
+  url.trim();
+  url.toLowerCase();
+
+  // Check scheme
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd == -1) {
+    Serial.println(F("[API] ❌ Invalid URL format"));
+    return false;
+  }
+
+  String protocol = url.substring(0, schemeEnd);
+  String remainder = url.substring(schemeEnd + 3);  // Skip "://"
+
+  // Extract host:port (stop at first '/')
+  int pathStart = remainder.indexOf('/');
+  String hostPort = (pathStart != -1) ? remainder.substring(0, pathStart) : remainder;
+
+  // Extract port (default: 80 for http, 443 for https)
+  int portStart = hostPort.indexOf(':');
+  String targetHost = hostPort;
+  int targetPort = (protocol == "https") ? 443 : 80;
+
+  if (portStart != -1) {
+    targetHost = hostPort.substring(0, portStart);
+    int parsedPort = hostPort.substring(portStart + 1).toInt();
+    if (parsedPort > 0 && parsedPort <= 65535) {
+      targetPort = parsedPort;
+    }
+  }
+
+  // === DNS Resolution with Caching (Core 3.3.7: 2-arg hostByName) ===
+  static String lastResolvedHost = "";
+  static IPAddress lastResolvedIP;
+  static unsigned long lastDnsLookup = 0;
+  const unsigned long DNS_CACHE_TTL = 60000;  // 60 seconds
+
+  IPAddress targetIP;
+  bool dnsOk = false;
+
+  // Check if we can use cached result
+  if (targetHost == lastResolvedHost && millis() - lastDnsLookup < DNS_CACHE_TTL) {
+    targetIP = lastResolvedIP;
+    dnsOk = true;
+  } else {
+    // ✅ CORRECT FOR CORE 3.3.7: hostByName takes ONLY 2 arguments
+    int dnsResult = WiFi.hostByName(targetHost.c_str(), targetIP);
+
+    if (dnsResult == 1) {
+      // Cache successful resolution
+      lastResolvedHost = targetHost;
+      lastResolvedIP = targetIP;
+      lastDnsLookup = millis();
+      dnsOk = true;
+    } else {
+      // DNS failed - try fallback: parse as literal IP
+      if (targetIP.fromString(targetHost)) {
+        dnsOk = true;  // Treat as direct IP address
+      }
+    }
+  }
+
+  // If DNS completely failed, check gateway as network health indicator
+  if (!dnsOk) {
+    IPAddress gw = WiFi.gatewayIP();
+    if (gw != IPAddress(0, 0, 0, 0)) {
+      WiFiClient gwClient;
+      gwClient.setTimeout(1500);
+      if (gwClient.connect(gw, 80)) {
+        gwClient.stop();
+        return true;  // Gateway reachable = network OK, server may be down
+      }
+    }
+    return false;  // Network issue
+  }
+
+  // === Attempt TCP connection to target server ===
+  WiFiClient client;
+  client.setTimeout(2500);  // 2.5s connection timeout
+
+  bool connected = false;
+
+  // Try connecting by IP first (faster, avoids redundant DNS)
+  if (client.connect(targetIP, targetPort)) {
+    connected = true;
+  }
+  // Fallback: try by hostname (for SNI/virtual hosting scenarios)
+  else if (!targetHost.equals(targetIP.toString()) && client.connect(targetHost.c_str(), targetPort)) {
+    connected = true;
+  }
+
+  if (connected) {
     client.stop();
-    Serial.printf(F(" Server reachable\n"));
     return true;
   }
-  IPAddress gw = WiFi.gatewayIP();
-  if (gw == IPAddress(0, 0, 0, 0) || WiFi.localIP() == IPAddress(0, 0, 0, 0) || WiFi.RSSI() == 0) {
-    Serial.printf(F(" Invalid WiFi state (gw/IP/RSSI=0) → network issue\n"));
-    return false;
+
+  // === Connection failed: Diagnose network vs server issue ===
+  IPAddress localIP = WiFi.localIP();
+  IPAddress gateway = WiFi.gatewayIP();
+
+  // Check basic network configuration
+  if (localIP == IPAddress(0, 0, 0, 0) || gateway == IPAddress(0, 0, 0, 0)) {
+    return false;  // Invalid network config
   }
 
-  client.setTimeout(2000);
-  Serial.printf(F(" Testing gateway: %s:80\n"), gw.toString().c_str());
-  if (client.connect(gw, 80)) {  // Or port 53 if your router uses DNS
-    client.stop();
-    Serial.printf(F(" Gateway reachable → server likely down (no WiFi reconnect needed)\n"));
-    return true;  // Treat as "reachable" for WiFi purposes
-  } else {
-    Serial.printf(F(" Gateway unreachable → WiFi/network issue\n"));
-    return false;
+  // Test gateway reachability to distinguish server down vs network down
+  WiFiClient gwClient;
+  gwClient.setTimeout(1500);
+  if (gwClient.connect(gateway, 80)) {
+    gwClient.stop();
+    // Gateway reachable but server not = server issue (don't trigger WiFi reconnect)
+    return true;
   }
+
+  // Gateway unreachable = network issue (WiFi reconnection needed)
+  return false;
 }
 void syncState() {
   UpdateScreen('N', MACHINE_ID);
