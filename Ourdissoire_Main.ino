@@ -9,10 +9,8 @@
 #include <Preferences.h>
 #include <Update.h>
 #include <WebSocketsServer.h>
-#include <array>
 #include <queue>
 #include <cstring>
-#include <algorithm>
 #include <webinterface.h>
 
 // Hardware Pin Definitions
@@ -33,6 +31,7 @@ constexpr int SwichPowerUpTime = 60000UL;
 unsigned long restartTime = 0;
 bool webServerStarted = false;
 bool updating = false;
+bool portalRequested = false;  // ← Flag for screen "Portal" command
 
 bool useMockoon = true;
 String MOCKOON_BASE_URL = "http://192.168.1.122:7272/";
@@ -106,28 +105,6 @@ struct PendingWebRequest {
   unsigned long timestamp = 0;  // when it was queued
 };
 
-// ===== WiFi Reconnection State =====
-enum class WiFiReconnectState {
-  CONNECTED,
-  DISCONNECTED,
-  RECONNECTING,
-  PORTAL_REQUESTED
-};
-
-struct WiFiReconnectConfig {
-  unsigned long reconnectDelay = 1000;
-  unsigned long maxReconnectDelay = 30000;
-  unsigned long lastReconnectAttempt = 0;
-  uint8_t reconnectAttempts = 0;
-  const uint8_t maxAttemptsBeforeReset = 10;
-  WiFiReconnectState state = WiFiReconnectState::DISCONNECTED;  // Start disconnected
-};
-
-WiFiReconnectConfig wifiReconnect;
-unsigned long lastSuccessfulConnect = 0;
-const unsigned long MAX_DISCONNECT_TIME = 120000;  // 2 min before forced reset
-bool portalRequested = false;                      // ← Flag for screen "Portal" command
-
 unsigned long lastScreenSendTime = 0;
 const unsigned long MIN_SCREEN_SEND_INTERVAL = 20;
 
@@ -192,13 +169,11 @@ void setup(void) {
     preferences.begin("app-config", false);  // false = read/write mode (required for writing)
     bool needsWrite = false;
     if (!preferences.isKey("machine_id")) {
-      MACHINE_ID = 98;
       preferences.putUChar("machine_id", MACHINE_ID);
       Serial.println("NVS was empty → set default Machine ID = 99");
       needsWrite = true;
     }
     if (!preferences.isKey("api_url") || preferences.getString("api_url").length() == 0) {
-      API_BASE_URL = "http://192.168.1.248:7272/DBLOG/";
       preferences.putString("api_url", API_BASE_URL);
       Serial.println("NVS was empty → set default API URL");
       needsWrite = true;
@@ -243,34 +218,33 @@ void setup(void) {
   // check if there are an saved wifi credentials and attempt to reconnect
   {
     host = "machine" + String(MACHINE_ID);
-
-    // === 🔑 CRITICAL: Register WiFi event handler BEFORE any WiFi calls ===
     WiFi.onEvent(WiFiEvent);
-    WiFi.setAutoReconnect(false);  // We handle reconnection manually
-    WiFi.setSleep(false);          // Disable sleep for industrial reliability
+    WiFi.setAutoReconnect(true);
+    WiFi.setSleep(false);
     WiFi.setHostname(host.c_str());
 
-    // === Your exact flow: Check credentials → portal or connect ===
     String apName = "Machine" + String(MACHINE_ID);
     String apPass = "Nsight1234";
 
-    // Configure WiFiManager ONCE here
-    wm.setConfigPortalTimeout(180);
+    wm.setConfigPortalTimeout(180);  // 3 minutes if portal opens
     wm.setConnectTimeout(20);
-    wm.setConnectRetries(3);
     wm.setCleanConnect(true);
-    wm.setBreakAfterConfig(true);
     wm.setShowInfoErase(false);
     wm.setShowInfoUpdate(false);
 
-    if (!wm.getWiFiIsSaved()) {
-      // NO saved credentials → open portal with your hostname
-      Serial.println(F("[Setup] No saved credentials → opening config portal"));
-      wm.setConfigPortalBlocking(true);  // Block until configured
-      wm.startConfigPortal(apName.c_str(), apPass.c_str());
-      // After portal: credentials saved, continue to connect
+    // === Main logic: let WiFiManager decide ===
+    Serial.println(F("[WiFi] Starting autoConnect..."));
+    bool connected = wm.autoConnect(apName.c_str(), apPass.c_str());
+
+    if (connected) {
+      Serial.printf(F("[WiFi] ✅ Connected! IP: %s\n"), WiFi.localIP().toString().c_str());
+      state.wifiConnected = true;
+    } else {
+      Serial.println(F("[WiFi] ⏳ Could not connect - portal was shown or connection failed. Auto-retry in background via events."));
+      state.wifiConnected = false;
     }
-    setupWiFi();
+
+    state.wifiSetupDone = true;
   }
 
   Serial.printf(F("✅ Setup complete - Host: %s.local | WiFi: %s\n"), host.c_str(), state.wifiConnected ? "CONNECTED" : "DISCONNECTED");
@@ -293,16 +267,6 @@ void setup(void) {
         break;
     }
   });
-
-  if (MDNS.begin(host.c_str())) {
-    Serial.printf(F("mDNS started: %s.local\n"), host.c_str());
-    MDNS.addService("http", "tcp", 80);
-    MDNS.addServiceTxt("http", "tcp", "dev", "NsighTex");
-    MDNS.addServiceTxt("http", "tcp", "id", String(MACHINE_ID));
-    MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
-  } else {
-    Serial.printf(F("mDNS begin failed!\n"));
-  }
 }
 void loop(void) {
   if (webServerStarted) {
@@ -508,9 +472,8 @@ void processScreenData(const char* data) {
     fetchMachineData();
     syncState();
   } else if (strcmp(cmd, "Portal") == 0) {
-    Serial.println(F("[Screen] 🚪 Portal command received → opening config portal"));
+    Serial.println(F(" 🚪 Portal command received → opening config portal"));
     portalRequested = true;  // ← Set flag, don't block loop
-    wifiReconnect.state = WiFiReconnectState::PORTAL_REQUESTED;
     UpdateScreen('X', 0);
   }
 }
@@ -900,8 +863,6 @@ void setupWiFi() {
   WiFi.persistent(true);
   WiFi.setSleep(false);
 
-  digitalWrite(39, LOW);
-
   String apName = "Machine" + String(MACHINE_ID);
   String apPass = "Nsight1234";  // Portal password
 
@@ -930,59 +891,60 @@ void setupWiFi() {
 }
 void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
+    // === Standard WiFi events (0-25) ===
+    case ARDUINO_EVENT_WIFI_READY:
+      Serial.println(F("[WiFi] Interface ready"));
+      break;
+    case ARDUINO_EVENT_WIFI_STA_START:
+      Serial.println(F("[WiFi] Station started"));
+      break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.println(F("[WiFi] ✅ Connected to AP"));
-      wifiReconnect.state = WiFiReconnectState::CONNECTED;
-      wifiReconnect.reconnectAttempts = 0;
-      wifiReconnect.reconnectDelay = 1000;
-      lastSuccessfulConnect = millis();
+      Serial.println(F("[WiFi] Connected to AP"));
       state.wifiConnected = true;
       digitalWrite(39, HIGH);
       UpdateScreen('X', 1);
-
-      // Re-init services after stable connection
-      vTaskDelay(300 / portTICK_PERIOD_MS);
-      resetMDNS();
-      if (!webServerStarted) handleWebServer();
-      fetchMachineData();
-      state.initialStateLoaded = false;
       break;
-
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       {
-        // ✅ FIX: Cast uint8_t to wifi_err_reason_t explicitly
         wifi_err_reason_t reason = static_cast<wifi_err_reason_t>(info.wifi_sta_disconnected.reason);
-
-        Serial.printf(F("[WiFi] ❌ Disconnected. Reason: %d (%s)\n"),
-                      static_cast<int>(reason),
-                      WiFi.disconnectReasonName(reason));
-
+        Serial.printf(F("[WiFi] Disconnected. Reason: %d (%s)\n"), static_cast<int>(reason), WiFi.disconnectReasonName(reason));
         state.wifiConnected = false;
         digitalWrite(39, LOW);
         UpdateScreen('X', 0);
-
-        if (wifiReconnect.state != WiFiReconnectState::RECONNECTING && wifiReconnect.state != WiFiReconnectState::PORTAL_REQUESTED) {
-          wifiReconnect.state = WiFiReconnectState::DISCONNECTED;
-          wifiReconnect.lastReconnectAttempt = millis();
-        }
+        MDNS.end();
         break;
       }
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf(F("[WiFi] 🎯 Got IP: %s\n"), WiFi.localIP().toString().c_str());
-      lastSuccessfulConnect = millis();
+      Serial.printf(F("[WiFi] ✅ Got IP: %s | RSSI: %d\n"), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      resetMDNS();
+      if (!webServerStarted) handleWebServer();
       break;
-
     case ARDUINO_EVENT_WIFI_STA_LOST_IP:
       Serial.println(F("[WiFi] ⚠️ Lost IP address"));
       state.wifiConnected = false;
+      MDNS.end();
       break;
 
-    default: Serial.printf(F("[WiFi] Unhandled event: %d\n"), event); break;
+    // === IP-layer events (100-199) ===
+    case 100:  // ARDUINO_EVENT_IP_STA_GOT_IP
+      Serial.printf(F("[IP] ✅ IPv4 assigned: %s\n"), WiFi.localIP().toString().c_str());
+      break;
+    case 111:  // ARDUINO_EVENT_IP_AP_STADISCONNECTED
+      Serial.println(F("[IP] Client disconnected from AP (IP layer)"));
+      break;
+    case 130:  // ARDUINO_EVENT_ETH_GOT_IP
+      Serial.println(F("[IP] Ethernet got IP (if enabled)"));
+      break;
+
+    default:
+      Serial.printf(F("[WiFi] ℹ️ Unhandled event: %d\n"), event);
+      Serial.printf(F("   Full event info: event_id=%d\n"), event);
+      break;
   }
 }
 void handleWiFiReconnection() {
-  // === Handle screen-triggered portal request ===
-  if (portalRequested || wifiReconnect.state == WiFiReconnectState::PORTAL_REQUESTED) {
+  // === ONLY handle screen-triggered portal request ===
+  if (portalRequested) {
     Serial.println(F("[WiFi] 🚪 Opening config portal (screen request)..."));
 
     // Stop current WiFi to avoid conflicts
@@ -992,85 +954,18 @@ void handleWiFiReconnection() {
     String apName = "Machine" + String(MACHINE_ID);
     String apPass = "Nsight1234";
 
-    // Open portal NON-BLOCKING (so loop can continue)
-    wm.setConfigPortalTimeout(180);  // Auto-close after 3 min
-    wm.startConfigPortal(apName.c_str(), apPass.c_str());
+    wm.setConfigPortalTimeout(180);                        // 3 min timeout for user to configure
+    wm.startConfigPortal(apName.c_str(), apPass.c_str());  // Blocking
 
-    // Reset flags
+    // Reset flag after portal closes
     portalRequested = false;
-    wifiReconnect.state = WiFiReconnectState::DISCONNECTED;
-    wifiReconnect.lastReconnectAttempt = millis();
 
-    // After portal: try to reconnect with new creds
-    setupWiFi();
-    return;
-  }
-  // === If connected, just monitor ===
-  if (wifiReconnect.state == WiFiReconnectState::CONNECTED) {
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println(F("[WiFi] 🔄 Silent disconnect detected"));
-      wifiReconnect.state = WiFiReconnectState::DISCONNECTED;
-      wifiReconnect.lastReconnectAttempt = millis();
+    // If new credentials were saved, attempt reconnect (no portal fallback)
+    if (wm.getWiFiIsSaved()) {
+      Serial.println(F("[WiFi] New credentials saved → attempting reconnect..."));
+      wm.setConfigPortalTimeout(0);  // Disable portal fallback
+      wm.autoConnect(apName.c_str(), apPass.c_str());
     }
-    return;
-  }
-  // === Handle reconnection with exponential backoff ===
-  if (wifiReconnect.state == WiFiReconnectState::DISCONNECTED) {
-    unsigned long now = millis();
-
-    // Wait for backoff delay
-    if (now - wifiReconnect.lastReconnectAttempt >= wifiReconnect.reconnectDelay) {
-      Serial.printf(F("[WiFi] 🔄 Reconnect attempt %d/%d (delay: %lus)\n"),
-                    wifiReconnect.reconnectAttempts + 1,
-                    wifiReconnect.maxAttemptsBeforeReset,
-                    wifiReconnect.reconnectDelay / 1000);
-
-      wifiReconnect.state = WiFiReconnectState::RECONNECTING;
-      wifiReconnect.lastReconnectAttempt = now;
-
-      // ESP32-S3: Clean WiFi driver before reconnect
-      WiFi.scanDelete();
-      esp_wifi_stop();
-      delay(50);
-      esp_wifi_start();
-
-      // Try reconnect (NON-BLOCKING, no portal)
-      wm.setConfigPortalTimeout(0);
-      wm.autoConnect();  // Event handler will update state
-    }
-    return;
-  }
-  // === Check if reconnection succeeded/failed ===
-  if (wifiReconnect.state == WiFiReconnectState::RECONNECTING) {
-    if (millis() - wifiReconnect.lastReconnectAttempt > 10000) {  // 10s timeout
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println(F("[WiFi] ✅ Reconnection successful"));
-        wifiReconnect.state = WiFiReconnectState::CONNECTED;
-        wifiReconnect.reconnectAttempts = 0;
-        wifiReconnect.reconnectDelay = 1000;
-      } else {
-        Serial.println(F("[WiFi] ❌ Reconnection failed"));
-        wifiReconnect.state = WiFiReconnectState::DISCONNECTED;
-
-        // Exponential backoff
-        wifiReconnect.reconnectDelay = min(
-          wifiReconnect.reconnectDelay * 2,
-          wifiReconnect.maxReconnectDelay);
-        wifiReconnect.reconnectAttempts++;
-
-        // Force reset after too many failures
-        if (wifiReconnect.reconnectAttempts >= wifiReconnect.maxAttemptsBeforeReset) {
-          Serial.println(F("[WiFi] ⚠️ Too many failures → scheduling reset"));
-          restartTime = millis() + 5000;
-        }
-      }
-    }
-    return;
-  }
-  // === Safety: Reset if disconnected too long ===
-  if (!state.wifiConnected && lastSuccessfulConnect > 0 && millis() - lastSuccessfulConnect > MAX_DISCONNECT_TIME) {
-    Serial.println(F("[WiFi] ⚠️ Disconnected >2min → forcing reset"));
-    restartTime = millis() + 2000;
   }
 }
 
@@ -1341,15 +1236,33 @@ bool isAuthenticated() {
   return false;
 }
 void resetMDNS() {
+  // Clean up any existing instance
   MDNS.end();
-  delay(100);  // Small delay
-  if (!MDNS.begin(host.c_str())) {
-    Serial.printf(F("Error setting up mDNS responder!\n"));
-  } else {
-    Serial.printf(F("mDNS responder started: %s .local \n"), host);
+  delay(50);  // Brief pause for cleanup
+
+  // Ensure hostname is mDNS-compliant: lowercase, a-z/0-9/- only, <63 chars
+  String safeHost = host;
+  safeHost.toLowerCase();
+  safeHost.replace("_", "-");  // mDNS doesn't allow underscores
+
+  if (safeHost.length() == 0 || safeHost.length() > 63) {
+    Serial.printf(F("❌ Invalid hostname for mDNS: '%s'\n"), safeHost.c_str());
+    return;
+  }
+
+  // Start mDNS responder
+  if (MDNS.begin(safeHost.c_str())) {
+    Serial.printf(F("✅ mDNS started: %s.local\n"), safeHost.c_str());
+    // Add services
     MDNS.addService("http", "tcp", 80);
-    // Optional: make it show up nicer in some browsers
+    MDNS.addService("ws", "tcp", 81);  // Your WebSocket port
     MDNS.addServiceTxt("http", "tcp", "device", "NsighTex");
+    MDNS.addServiceTxt("http", "tcp", "id", String(MACHINE_ID));
+    MDNS.setInstanceName(("Machine-" + String(MACHINE_ID)).c_str());
+
+  } else {
+    Serial.printf(F("❌ mDNS.begin() FAILED for %s.local\n"), safeHost.c_str());
+    Serial.printf(F("   WiFi.status(): %d, IP: %s\n"), WiFi.status(), WiFi.localIP().toString().c_str());
   }
 }
 
