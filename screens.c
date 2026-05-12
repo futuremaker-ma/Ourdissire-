@@ -113,14 +113,6 @@ void action_send_command(lv_event_t *e) {
     command = "Circ";
     Drum_circemferance = lv_textarea_get_text(objects.circemferance_text_area);
 
-  } else if (target == objects.set_database_url) {
-    command = "URL";
-    static char urlstr[64];
-    snprintf(urlstr, sizeof(urlstr), "http://%s:%s/%s/",
-             lv_textarea_get_text(objects.ip_textarea),
-             lv_textarea_get_text(objects.port_textarea),
-             lv_textarea_get_text(objects.db_textarea));
-    URL = urlstr;
   } else if (target == objects.open_portal) {
     command = "Portal";
   } else {
@@ -193,10 +185,8 @@ void action_show_keyboard(lv_event_t *e) {
     lv_keyboard_set_textarea(kb, ta);
 
     // Set keyboard mode
-    if (ta == objects.machine_id_text_area || ta == objects.ip_textarea || ta == objects.port_textarea || objects.avencement_textarea || objects.circemferance_text_area) {
+    if (ta == objects.machine_id_text_area || objects.avencement_textarea || objects.circemferance_text_area) {
       lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
-    } else if (ta == objects.db_textarea) {
-      lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_USER_1);
     } else if (ta == objects.operator_id_text_area) {
       lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);  // Force numerical
     } else {
@@ -207,14 +197,9 @@ void action_show_keyboard(lv_event_t *e) {
     lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(kb);
 
-    // Scroll ONLY when focusing db_textarea or port_textarea
     if (content_panel != NULL && ta != NULL) {
       lv_obj_update_layout(content_panel);
-
-      if (ta == objects.db_textarea || ta == objects.port_textarea || objects.ip_textarea) {
-        lv_obj_set_scrollbar_mode(content_panel, LV_SCROLLBAR_MODE_AUTO);
-        lv_obj_scroll_to_view(ta, LV_ANIM_ON);
-      } else if (ta == objects.operator_id_text_area) {
+      if (ta == objects.operator_id_text_area) {
         // On Operator ID page we usually don't need much scroll
         lv_obj_set_scrollbar_mode(content_panel, LV_SCROLLBAR_MODE_OFF);
       }
@@ -498,7 +483,7 @@ static lv_obj_t *create_avencement_panel(void) {
 
   create_label_centered(objects.avencement_panel, 90, 8, "Avencement", &lv_font_montserrat_20);
 
-  objects.avencement_textarea = create_textarea(objects.avencement_panel, 5, 45, 295, 55, "Inserer avencement", "0123456789.", 8, action_show_keyboard);
+  objects.avencement_textarea = create_textarea(objects.avencement_panel, 5, 45, 295, 55, "1.667", "0123456789.", 8, action_show_keyboard);
   lv_obj_add_event_cb(objects.avencement_panel, action_show_keyboard, LV_EVENT_FOCUSED, NULL);
   lv_obj_set_style_text_font(objects.avencement_textarea, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
 
@@ -609,6 +594,7 @@ void populate_DefaultPanel(lv_obj_t *parent) {
     objects.beam_length = create_content_panel(objects.Ourdissage_Panel, 3, 3, 138, 75);
     lv_obj_set_style_outline_color(objects.beam_length, lv_color_hex(0xffebdd1c), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_outline_width(objects.beam_length, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_remove_flag(objects.beam_length, LV_OBJ_FLAG_SCROLLABLE);
 
     create_label(objects.beam_length, 0, 0, "Length", &lv_font_montserrat_16);
     create_label(objects.beam_length, 114, 0, "m", &lv_font_montserrat_16);
@@ -687,18 +673,23 @@ void populate_HaltCodesPanel(lv_obj_t *parent) {
     y += 55;
     lv_obj_t *btn4 = create_button_with_font(parent, 5, y, 300, 50, "Nouage et Passage (105)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)105);
     style_halt_button(btn4, 105);
+    lv_obj_clear_state(btn4, LV_STATE_DISABLED);
     y += 55;
     lv_obj_t *btn5 = create_button_with_font(parent, 5, y, 300, 50, "Piquage (107)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)107);
     style_halt_button(btn5, 107);
+    lv_obj_clear_state(btn5, LV_STATE_DISABLED);
     y += 55;
     lv_obj_t *btn6 = create_button_with_font(parent, 5, y, 300, 50, "Ourdissage (109)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)109);
     style_halt_button(btn6, 109);
+    lv_obj_clear_state(btn6, LV_STATE_DISABLED);
     y += 55;
     lv_obj_t *btn7 = create_button_with_font(parent, 5, y, 300, 50, "Ensouplage (111)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)111);
     style_halt_button(btn7, 111);
+    lv_obj_clear_state(btn7, LV_STATE_DISABLED);
     y += 55;
     lv_obj_t *btn8 = create_button_with_font(parent, 5, y, 300, 50, "Fin Ensouplage (112)", &lv_font_montserrat_18, action_set_temp_code, (void *)(intptr_t)112);
     style_halt_button(btn8, 112);
+    lv_obj_clear_state(btn8, LV_STATE_DISABLED);
 
     create_encantrage_panel();
   } else if (currentCategory == MECHANICAL) {
@@ -808,25 +799,8 @@ void populate_SettingsPanel(lv_obj_t *parent) {
   objects.set_new_circemferance = create_button(objects.set_circemferance, 230, -6, 55, 38, "Set", action_send_command, NULL);
   lv_obj_set_style_bg_color(objects.set_new_circemferance, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
 
-  // ==================== Database Section ====================
-  objects.set_database_link = create_content_panel(parent, 3, 126, 300, 210);
-  lv_obj_set_style_outline_width(objects.set_database_link, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_outline_color(objects.set_database_link, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_pad_bottom(objects.set_database_link, 100, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-  create_label(objects.set_database_link, 5, 15, "Server IP", &lv_font_montserrat_18);
-  objects.ip_textarea = create_textarea(objects.set_database_link, 116, 5, 175, 40, "192.168.1.xx", ".,0,1,2,3,4,5,6,7,8,9", 15, action_show_keyboard);
-
-  create_label(objects.set_database_link, 5, 66, "API PORT", &lv_font_montserrat_18);
-  objects.port_textarea = create_textarea(objects.set_database_link, 116, 55, 175, 40, "7272", "0,1,2,3,4,5,6,7,8,9", 8, action_show_keyboard);
-
-  create_label(objects.set_database_link, 5, 116, "Database", &lv_font_montserrat_18);
-  objects.db_textarea = create_textarea(objects.set_database_link, 116, 105, 175, 40, "DBLOG", NULL, 32, action_show_keyboard);
-
-  objects.set_database_url = create_button_with_font(objects.set_database_link, 3, 157, 290, 40, "Set database URL", &lv_font_montserrat_20, action_send_command, NULL);
-
   // ==================== Open Portal Button ====================
-  objects.open_portal = create_button_with_font(parent, 8, 345, 290, 40, "Open WIFI Portal", &lv_font_montserrat_20, action_send_command, NULL);
+  objects.open_portal = create_button_with_font(parent, 8, 126, 290, 40, "Open WIFI Portal", &lv_font_montserrat_20, action_send_command, NULL);
 }
 
 void create_screen_main(void) {
